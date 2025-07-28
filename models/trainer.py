@@ -517,19 +517,15 @@ class Trainer:
         DC: bool = False,
         RC: bool = False
     ):
-        # Device and hyperparameters
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.base_lr = learning_rate
-        self.base_wd =0.0
+        self.base_wd = 0.0
 
-        # Model and loss
-        # self.model = MultiTaskGCN(num_hiddens, num_features, num_classes).to(self.device)
         self.model = MultiTaskGCN(num_hiddens, num_features, num_classes, dropout=0.2).to(self.device)
         self.criterion = FocalLoss(alpha=0.75, gamma=2)
 
-        # Build edge_index and edge_attr
         num_nodes = 19
         edge_index = torch.tril_indices(num_nodes, num_nodes, offset=-1)
         adj_proc = AdjacencyMatrixProcessor(pooled_results, data_directory=r"E:\tuh_data\train")
@@ -538,25 +534,17 @@ class Trainer:
             if RC else
             adj_proc.compute_all_edge_weights(DC=True, RC=False).mean(dim=0)
         )
-        # # Ensure correct number of edges
-        # expected = num_nodes * (num_nodes - 1) // 2
-        # if weights.numel() > expected:
-        #     weights = weights[:expected]
-        # elif weights.numel() < expected:
-        #     weights = torch.cat([weights, torch.zeros(expected - weights.numel())])
 
-        # Filter out None entries if any exist
-        if isinstance(all_weights, list):
-            for i, w in enumerate(all_weights):
+        valid_weights = []
+        if isinstance(weights, list):
+            for i, w in enumerate(weights):
                 if w is not None and isinstance(w, torch.Tensor):
                     valid_weights.append(w)
                 else:
                     print(f"⚠️ Skipping invalid edge weights at index {i}")
         else:
-            print("⚠️ Edge weight computation did not return a list. Using default.")
-            valid_weights = []
+            valid_weights.append(weights)
 
-        # Use mean of valid edge weights or default
         expected = num_nodes * (num_nodes - 1) // 2
         if valid_weights:
             weights = torch.stack(valid_weights).mean(dim=0)
@@ -570,8 +558,6 @@ class Trainer:
 
         self.edge_index = edge_index.to(self.device)
         self.edge_attr = weights.to(self.device)
-
-        # Scalers for regression
         self.feature_scaler = None
         self.regression_scaler = None
 
@@ -590,17 +576,11 @@ class Trainer:
         return max(1 - ss_res / ss_tot, 0.0)
 
     def create_graph_batches(self, X, Y, task: str = None):
-        """
-        Build DataLoader from features X and labels Y.
-        For detection/classification: X[i] shape (T, nodes, features) -> mean over T.
-        For early_reg: X[i] already shape (nodes, features).
-        """
         data_list = []
         for i in range(len(X)):
             x_np = X[i]
             if task != "early_reg":
-                # collapse time dimension
-                x_np = x_np.mean(axis=0)  # now (nodes, features)
+                x_np = x_np.mean(axis=0)
             x = torch.tensor(x_np, dtype=torch.float, device=self.device)
 
             y_val = Y[i]
@@ -628,36 +608,34 @@ class Trainer:
         detection: bool = False,
         classification: bool = False,
         early_reg: bool = False,
-        early_clf: bool = False
+        early_clf: bool = False,
+        test_size: float = 0.2,
+        random_state: int = 42
     ):
         os.makedirs("models/checkpoints", exist_ok=True)
 
-        # Prepare data loaders
         if early_reg:
-            # Regression: clip, log+scale, train/val split
             X = np.array(X)
             Y = np.array(Y)
             Y = np.maximum(Y, 1e-3)
-
-            # collapse time
-            X_mean = X.mean(axis=1)  # (N, nodes, features)
+            X_mean = X.mean(axis=1)
             N, nodes, feats = X_mean.shape
-            X_flat = X_mean.reshape(N, -1)  # flatten to (N, nodes*features)
+            X_flat = X_mean.reshape(N, -1)
 
             X_train, X_val, Y_train, Y_val = train_test_split(
-                X_flat, Y, test_size=0.2, random_state=42
+                X_flat, Y, test_size=test_size, random_state=random_state
             )
-            # feature scaling
             self.feature_scaler = StandardScaler()
             X_train = self.feature_scaler.fit_transform(X_train)
             X_val = self.feature_scaler.transform(X_val)
-            # log + scale targets
+
             Y_log = np.log1p(Y_train).reshape(-1, 1)
             self.regression_scaler = StandardScaler()
             Y_train_scaled = self.regression_scaler.fit_transform(Y_log).flatten()
             Y_val_scaled = self.regression_scaler.transform(
                 np.log1p(Y_val).reshape(-1, 1)
             ).flatten()
+
             train_loader = self.create_graph_batches(
                 X_train.reshape(-1, nodes, feats), Y_train_scaled, task="early_reg"
             )
@@ -674,20 +652,31 @@ class Trainer:
                 patience=3, verbose=True, min_lr=1e-6
             )
         else:
-            # Detection, classification, or early_clf
             task = (
                 "detection" if detection else
                 "classification" if classification else
                 "early_clf"
             )
-            train_loader = self.create_graph_batches(X, Y, task=task)
+
+            stratify = Y if (classification or early_clf) else None
+            idx = np.arange(len(X))
+            train_idx, val_idx = train_test_split(
+                idx, test_size=test_size, random_state=random_state, stratify=stratify
+            )
+            X_train = [X[i] for i in train_idx]
+            Y_train = [Y[i] for i in train_idx]
+            X_val   = [X[i] for i in val_idx]
+            Y_val   = [Y[i] for i in val_idx]
+
+            train_loader = self.create_graph_batches(X_train, Y_train, task=task)
+            val_loader = self.create_graph_batches(X_val, Y_val, task=task)
+
             print(f"=================== {task.capitalize()} ===================")
             self.optimizer = optim.Adam(
                 self.model.parameters(), lr=self.base_lr, weight_decay=self.base_wd
             )
             self.scheduler = StepLR(self.optimizer, step_size=10, gamma=0.5)
 
-        # Training loop
         for epoch in range(1, self.num_epochs + 1):
             self.model.train()
             epoch_loss = 0.0
@@ -697,34 +686,23 @@ class Trainer:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
 
-                # Forward + loss + preds
                 if detection:
-                    out = self.model(
-                        batch.x, batch.edge_index, batch, task="detection"
-                    ).view(-1)
-                    loss = F.binary_cross_entropy_with_logits(
-                        out, batch.y.float()
-                    )
+                    out = self.model(batch.x, batch.edge_index, batch, task="detection").view(-1)
+                    loss = F.binary_cross_entropy_with_logits(out, batch.y.float())
                     preds = (torch.sigmoid(out) > 0.5).cpu().numpy()
                     labels = batch.y.cpu().numpy()
                 elif classification:
-                    out = self.model(
-                        batch.x, batch.edge_index, batch, task="classification"
-                    )
+                    out = self.model(batch.x, batch.edge_index, batch, task="classification")
                     loss = F.cross_entropy(out, batch.y)
                     preds = out.argmax(dim=1).cpu().numpy()
                     labels = batch.y.cpu().numpy()
                 elif early_reg:
-                    out = self.model(
-                        batch.x, batch.edge_index, batch, task="forecast_time"
-                    ).view(-1)
+                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_time").view(-1)
                     loss = F.smooth_l1_loss(out, batch.y.float())
                     preds = out.detach().cpu().numpy()
                     labels = batch.y.cpu().numpy()
-                else:  # early_clf
-                    out = self.model(
-                        batch.x, batch.edge_index, batch, task="forecast_label"
-                    )
+                else:
+                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_label")
                     loss = F.cross_entropy(out, batch.y)
                     preds = out.argmax(dim=1).cpu().numpy()
                     labels = batch.y.cpu().numpy()
@@ -737,78 +715,60 @@ class Trainer:
 
             avg_loss = epoch_loss / len(train_loader)
 
-            # Metrics & scheduler
             if early_reg:
-                # Inverse transform for metrics
-                inv_preds = np.expm1(
-                    self.regression_scaler.inverse_transform(
-                        np.array(all_preds).reshape(-1, 1)
-                    )
-                ).flatten()
-                inv_true = np.expm1(
-                    self.regression_scaler.inverse_transform(
-                        np.array(all_labels).reshape(-1, 1)
-                    )
-                ).flatten()
+                inv_preds = np.expm1(self.regression_scaler.inverse_transform(np.array(all_preds).reshape(-1, 1))).flatten()
+                inv_true = np.expm1(self.regression_scaler.inverse_transform(np.array(all_labels).reshape(-1, 1))).flatten()
                 train_r2 = self.safe_r2_score(inv_true, inv_preds)
                 train_rmse = np.sqrt(mean_squared_error(inv_true, inv_preds))
 
-                # Validation
                 self.model.eval()
                 val_preds, val_true = [], []
                 with torch.no_grad():
                     for batch in val_loader:
                         batch = batch.to(self.device)
-                        out = self.model(
-                            batch.x, batch.edge_index, batch, task="forecast_time"
-                        ).view(-1).cpu().numpy()
-                        p = np.expm1(
-                            self.regression_scaler.inverse_transform(
-                                out.reshape(-1, 1)
-                            )
-                        ).flatten()
-                        t = np.expm1(
-                            self.regression_scaler.inverse_transform(
-                                batch.y.cpu().numpy().reshape(-1, 1)
-                            )
-                        ).flatten()
+                        out = self.model(batch.x, batch.edge_index, batch, task="forecast_time").view(-1).cpu().numpy()
+                        p = np.expm1(self.regression_scaler.inverse_transform(out.reshape(-1, 1))).flatten()
+                        t = np.expm1(self.regression_scaler.inverse_transform(batch.y.cpu().numpy().reshape(-1, 1))).flatten()
                         val_preds.extend(p)
                         val_true.extend(t)
 
                 val_r2 = self.safe_r2_score(val_true, val_preds)
                 val_rmse = np.sqrt(mean_squared_error(val_true, val_preds))
 
-                print(
-                    f"Epoch {epoch}/{self.num_epochs} - "
-                    f"Loss: {avg_loss:.4f} | "
-                    f"Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f} | "
-                    f"Val   R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}"
-                )
+                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f} | Val R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}")
                 self.scheduler.step(val_r2)
             else:
                 acc = accuracy_score(all_labels, all_preds)
-                print(
-                    f"Epoch {epoch}/{self.num_epochs} - "
-                    f"Loss: {avg_loss:.4f} | Acc: {acc:.4f}"
-                )
+
+                self.model.eval()
+                v_preds, v_labels = [], []
+                with torch.no_grad():
+                    for batch in val_loader:
+                        batch = batch.to(self.device)
+                        if detection:
+                            out = self.model(batch.x, batch.edge_index, batch, task="detection").view(-1)
+                            v_preds.extend((torch.sigmoid(out) > 0.5).cpu().numpy())
+                            v_labels.extend(batch.y.cpu().numpy())
+                        elif classification:
+                            out = self.model(batch.x, batch.edge_index, batch, task="classification")
+                            v_preds.extend(out.argmax(dim=1).cpu().numpy())
+                            v_labels.extend(batch.y.cpu().numpy())
+                        else:
+                            out = self.model(batch.x, batch.edge_index, batch, task="forecast_label")
+                            v_preds.extend(out.argmax(dim=1).cpu().numpy())
+                            v_labels.extend(batch.y.cpu().numpy())
+                val_acc = accuracy_score(v_labels, v_preds)
+
+                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | Acc: {acc:.4f} | Val Acc: {val_acc:.4f}")
                 if isinstance(self.scheduler, ReduceLROnPlateau):
-                    self.scheduler.step(acc)
+                    self.scheduler.step(val_acc)
                 else:
                     self.scheduler.step()
 
-            # Checkpointing
-            tag = (
-                "detection" if detection else
-                "classification" if classification else
-                "early_reg" if early_reg else
-                "early_clf"
-            )
+            tag = "detection" if detection else "classification" if classification else "early_reg" if early_reg else "early_clf"
             ckpt_dir = f"models/checkpoints/{tag}"
             os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(
-                self.model.state_dict(),
-                os.path.join(ckpt_dir, f"{tag}_epoch_{epoch}.pth")
-            )
+            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, f"{tag}_epoch_{epoch}.pth"))
 
         print("Training complete!")
         return all_preds
