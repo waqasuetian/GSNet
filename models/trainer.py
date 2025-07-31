@@ -472,6 +472,310 @@
 
 
 
+# import os
+# import numpy as np
+# import torch
+# import torch.nn.functional as F
+# import torch.optim as optim
+# from torch_geometric.data import Data
+# from torch_geometric.loader import DataLoader
+# from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
+# from sklearn.preprocessing import StandardScaler
+# from sklearn.metrics import mean_squared_error, accuracy_score
+# from sklearn.model_selection import train_test_split
+
+# from models.model import MultiTaskGCN
+# from data.scripts.adjacancy_matrics import AdjacencyMatrixProcessor
+
+
+# class FocalLoss(torch.nn.Module):
+#     def __init__(self, alpha=1, gamma=2, reduction="mean"):
+#         super().__init__()
+#         self.alpha = alpha
+#         self.gamma = gamma
+#         self.reduction = reduction
+
+#     def forward(self, logits, targets):
+#         ce_loss = F.cross_entropy(logits, targets, reduction="none")
+#         pt = torch.exp(-ce_loss)
+#         loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+#         return loss.mean() if self.reduction == "mean" else loss.sum()
+
+
+# class Trainer:
+#     def __init__(
+#         self,
+#         num_features: int,
+#         num_hiddens: int,
+#         num_classes: int,
+#         dropout: float,
+#         num_heads: int,
+#         learning_rate: float,
+#         batch_size: int,
+#         num_epochs: int,
+#         pooled_results,
+#         DC: bool = False,
+#         RC: bool = False
+#     ):
+#         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         self.num_epochs = num_epochs
+#         self.batch_size = batch_size
+#         self.base_lr = learning_rate
+#         self.base_wd = 0.0
+
+#         self.model = MultiTaskGCN(num_hiddens, num_features, num_classes, dropout=0.2).to(self.device)
+#         self.criterion = FocalLoss(alpha=0.75, gamma=2)
+
+#         num_nodes = 19
+#         edge_index = torch.tril_indices(num_nodes, num_nodes, offset=-1)
+#         adj_proc = AdjacencyMatrixProcessor(pooled_results, data_directory=r"E:\tuh_data\train")
+#         weights = (
+#             adj_proc.compute_all_edge_weights(DC=False, RC=True).mean(dim=0)
+#             if RC else
+#             adj_proc.compute_all_edge_weights(DC=True, RC=False).mean(dim=0)
+#         )
+
+#         valid_weights = []
+#         if isinstance(weights, list):
+#             for i, w in enumerate(weights):
+#                 if w is not None and isinstance(w, torch.Tensor):
+#                     valid_weights.append(w)
+#                 else:
+#                     print(f"⚠️ Skipping invalid edge weights at index {i}")
+#         else:
+#             valid_weights.append(weights)
+
+#         expected = num_nodes * (num_nodes - 1) // 2
+#         if valid_weights:
+#             weights = torch.stack(valid_weights).mean(dim=0)
+#             if weights.numel() > expected:
+#                 weights = weights[:expected]
+#             elif weights.numel() < expected:
+#                 weights = torch.cat([weights, torch.zeros(expected - weights.numel())])
+#         else:
+#             print("⚠️ No valid edge weights found. Using default uniform weights.")
+#             weights = torch.ones(expected)
+
+#         self.edge_index = edge_index.to(self.device)
+#         self.edge_attr = weights.to(self.device)
+#         self.feature_scaler = None
+#         self.regression_scaler = None
+
+#     @staticmethod
+#     def safe_r2_score(y_true, y_pred):
+#         y_true = np.array(y_true).flatten()
+#         y_pred = np.array(y_pred).flatten()
+#         mask = np.isfinite(y_true) & np.isfinite(y_pred)
+#         y_true, y_pred = y_true[mask], y_pred[mask]
+#         if len(y_true) == 0:
+#             return 0.0
+#         ss_res = np.sum((y_true - y_pred) ** 2)
+#         ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+#         if ss_tot <= 0 or np.isnan(ss_res):
+#             return 0.0
+#         return max(1 - ss_res / ss_tot, 0.0)
+
+#     def create_graph_batches(self, X, Y, task: str = None):
+#         data_list = []
+#         for i in range(len(X)):
+#             x_np = X[i]
+#             if task != "early_reg":
+#                 x_np = x_np.mean(axis=0)
+#             x = torch.tensor(x_np, dtype=torch.float, device=self.device)
+
+#             y_val = Y[i]
+#             if task == "early_reg":
+#                 y = torch.tensor(y_val, dtype=torch.float, device=self.device)
+#             else:
+#                 y = torch.tensor(y_val, dtype=torch.long, device=self.device)
+
+#             if i < 3:
+#                 print(f"[{i}] Label: {y_val} -> Tensor: {y.item()}")
+
+#             data_list.append(Data(
+#                 x=x,
+#                 edge_index=self.edge_index,
+#                 edge_attr=self.edge_attr,
+#                 y=y
+#             ))
+
+#         return DataLoader(data_list, batch_size=self.batch_size, shuffle=True)
+
+#     def train(
+#         self,
+#         X,
+#         Y,
+#         detection: bool = False,
+#         classification: bool = False,
+#         early_reg: bool = False,
+#         early_clf: bool = False,
+#         test_size: float = 0.2,
+#         random_state: int = 42
+#     ):
+#         os.makedirs("models/checkpoints", exist_ok=True)
+
+#         if early_reg:
+#             X = np.array(X)
+#             Y = np.array(Y)
+#             Y = np.maximum(Y, 1e-3)
+#             X_mean = X.mean(axis=1)
+#             N, nodes, feats = X_mean.shape
+#             X_flat = X_mean.reshape(N, -1)
+
+#             X_train, X_val, Y_train, Y_val = train_test_split(
+#                 X_flat, Y, test_size=test_size, random_state=random_state
+#             )
+#             self.feature_scaler = StandardScaler()
+#             X_train = self.feature_scaler.fit_transform(X_train)
+#             X_val = self.feature_scaler.transform(X_val)
+
+#             Y_log = np.log1p(Y_train).reshape(-1, 1)
+#             self.regression_scaler = StandardScaler()
+#             Y_train_scaled = self.regression_scaler.fit_transform(Y_log).flatten()
+#             Y_val_scaled = self.regression_scaler.transform(
+#                 np.log1p(Y_val).reshape(-1, 1)
+#             ).flatten()
+
+#             train_loader = self.create_graph_batches(
+#                 X_train.reshape(-1, nodes, feats), Y_train_scaled, task="early_reg"
+#             )
+#             val_loader = self.create_graph_batches(
+#                 X_val.reshape(-1, nodes, feats), Y_val_scaled, task="early_reg"
+#             )
+
+#             print("=================== Early Regression ===================")
+#             self.optimizer = optim.Adam(
+#                 self.model.parameters(), lr=1e-4, weight_decay=0.0
+#             )
+#             self.scheduler = ReduceLROnPlateau(
+#                 self.optimizer, mode="max", factor=0.5,
+#                 patience=3, verbose=True, min_lr=1e-6
+#             )
+#         else:
+#             task = (
+#                 "detection" if detection else
+#                 "classification" if classification else
+#                 "early_clf"
+#             )
+
+#             stratify = Y if (classification or early_clf) else None
+#             idx = np.arange(len(X))
+#             train_idx, val_idx = train_test_split(
+#                 idx, test_size=test_size, random_state=random_state, stratify=stratify
+#             )
+#             X_train = [X[i] for i in train_idx]
+#             Y_train = [Y[i] for i in train_idx]
+#             X_val   = [X[i] for i in val_idx]
+#             Y_val   = [Y[i] for i in val_idx]
+
+#             train_loader = self.create_graph_batches(X_train, Y_train, task=task)
+#             val_loader = self.create_graph_batches(X_val, Y_val, task=task)
+
+#             print(f"=================== {task.capitalize()} ===================")
+#             self.optimizer = optim.Adam(
+#                 self.model.parameters(), lr=self.base_lr, weight_decay=self.base_wd
+#             )
+#             self.scheduler = StepLR(self.optimizer, step_size=10, gamma=0.5)
+
+#         for epoch in range(1, self.num_epochs + 1):
+#             self.model.train()
+#             epoch_loss = 0.0
+#             all_preds, all_labels = [], []
+
+#             for batch in train_loader:
+#                 batch = batch.to(self.device)
+#                 self.optimizer.zero_grad()
+
+#                 if detection:
+#                     out = self.model(batch.x, batch.edge_index, batch, task="detection").view(-1)
+#                     loss = F.binary_cross_entropy_with_logits(out, batch.y.float())
+#                     preds = (torch.sigmoid(out) > 0.5).cpu().numpy()
+#                     labels = batch.y.cpu().numpy()
+#                 elif classification:
+#                     out = self.model(batch.x, batch.edge_index, batch, task="classification")
+#                     loss = F.cross_entropy(out, batch.y)
+#                     preds = out.argmax(dim=1).cpu().numpy()
+#                     labels = batch.y.cpu().numpy()
+#                 elif early_reg:
+#                     out = self.model(batch.x, batch.edge_index, batch, task="forecast_time").view(-1)
+#                     loss = F.smooth_l1_loss(out, batch.y.float())
+#                     preds = out.detach().cpu().numpy()
+#                     labels = batch.y.cpu().numpy()
+#                 else:
+#                     out = self.model(batch.x, batch.edge_index, batch, task="forecast_label")
+#                     loss = F.cross_entropy(out, batch.y)
+#                     preds = out.argmax(dim=1).cpu().numpy()
+#                     labels = batch.y.cpu().numpy()
+
+#                 loss.backward()
+#                 self.optimizer.step()
+#                 epoch_loss += loss.item()
+#                 all_preds.extend(preds)
+#                 all_labels.extend(labels)
+
+#             avg_loss = epoch_loss / len(train_loader)
+
+#             if early_reg:
+#                 inv_preds = np.expm1(self.regression_scaler.inverse_transform(np.array(all_preds).reshape(-1, 1))).flatten()
+#                 inv_true = np.expm1(self.regression_scaler.inverse_transform(np.array(all_labels).reshape(-1, 1))).flatten()
+#                 train_r2 = self.safe_r2_score(inv_true, inv_preds)
+#                 train_rmse = np.sqrt(mean_squared_error(inv_true, inv_preds))
+
+#                 self.model.eval()
+#                 val_preds, val_true = [], []
+#                 with torch.no_grad():
+#                     for batch in val_loader:
+#                         batch = batch.to(self.device)
+#                         out = self.model(batch.x, batch.edge_index, batch, task="forecast_time").view(-1).cpu().numpy()
+#                         p = np.expm1(self.regression_scaler.inverse_transform(out.reshape(-1, 1))).flatten()
+#                         t = np.expm1(self.regression_scaler.inverse_transform(batch.y.cpu().numpy().reshape(-1, 1))).flatten()
+#                         val_preds.extend(p)
+#                         val_true.extend(t)
+
+#                 val_r2 = self.safe_r2_score(val_true, val_preds)
+#                 val_rmse = np.sqrt(mean_squared_error(val_true, val_preds))
+
+#                 print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f} | Val R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}")
+#                 self.scheduler.step(val_r2)
+#             else:
+#                 acc = accuracy_score(all_labels, all_preds)
+
+#                 self.model.eval()
+#                 v_preds, v_labels = [], []
+#                 with torch.no_grad():
+#                     for batch in val_loader:
+#                         batch = batch.to(self.device)
+#                         if detection:
+#                             out = self.model(batch.x, batch.edge_index, batch, task="detection").view(-1)
+#                             v_preds.extend((torch.sigmoid(out) > 0.5).cpu().numpy())
+#                             v_labels.extend(batch.y.cpu().numpy())
+#                         elif classification:
+#                             out = self.model(batch.x, batch.edge_index, batch, task="classification")
+#                             v_preds.extend(out.argmax(dim=1).cpu().numpy())
+#                             v_labels.extend(batch.y.cpu().numpy())
+#                         else:
+#                             out = self.model(batch.x, batch.edge_index, batch, task="forecast_label")
+#                             v_preds.extend(out.argmax(dim=1).cpu().numpy())
+#                             v_labels.extend(batch.y.cpu().numpy())
+#                 val_acc = accuracy_score(v_labels, v_preds)
+
+#                 print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | Acc: {acc:.4f} | Val Acc: {val_acc:.4f}")
+#                 if isinstance(self.scheduler, ReduceLROnPlateau):
+#                     self.scheduler.step(val_acc)
+#                 else:
+#                     self.scheduler.step()
+
+#             tag = "detection" if detection else "classification" if classification else "early_reg" if early_reg else "early_clf"
+#             ckpt_dir = f"models/checkpoints/{tag}"
+#             os.makedirs(ckpt_dir, exist_ok=True)
+#             torch.save(self.model.state_dict(), os.path.join(ckpt_dir, f"{tag}_epoch_{epoch}.pth"))
+
+#         print("Training complete!")
+#         return all_preds
+
+
+##new one
+
 import os
 import numpy as np
 import torch
@@ -483,10 +787,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, accuracy_score
 from sklearn.model_selection import train_test_split
-
 from models.model import MultiTaskGCN
 from data.scripts.adjacancy_matrics import AdjacencyMatrixProcessor
-
 
 class FocalLoss(torch.nn.Module):
     def __init__(self, alpha=1, gamma=2, reduction="mean"):
@@ -500,7 +802,6 @@ class FocalLoss(torch.nn.Module):
         pt = torch.exp(-ce_loss)
         loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
         return loss.mean() if self.reduction == "mean" else loss.sum()
-
 
 class Trainer:
     def __init__(
@@ -517,88 +818,126 @@ class Trainer:
         DC: bool = False,
         RC: bool = False
     ):
+        # Device and hyperparameters
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.base_lr = learning_rate
         self.base_wd = 0.0
 
-        self.model = MultiTaskGCN(num_hiddens, num_features, num_classes, dropout=0.2).to(self.device)
+        # Model and loss
+        self.model = MultiTaskGCN(
+            in_dim=100,  # Match input feature dimension (100 features)
+            hidden_dim=num_hiddens,
+            num_classes=num_classes,
+            dropout=0.5  # Match model.py default
+        ).to(self.device)
         self.criterion = FocalLoss(alpha=0.75, gamma=2)
 
+        # Build edge_index and edge_attr
         num_nodes = 19
         edge_index = torch.tril_indices(num_nodes, num_nodes, offset=-1)
         adj_proc = AdjacencyMatrixProcessor(pooled_results, data_directory=r"E:\tuh_data\train")
-        weights = (
-            adj_proc.compute_all_edge_weights(DC=False, RC=True).mean(dim=0)
-            if RC else
-            adj_proc.compute_all_edge_weights(DC=True, RC=False).mean(dim=0)
-        )
-
-        valid_weights = []
-        if isinstance(weights, list):
-            for i, w in enumerate(weights):
-                if w is not None and isinstance(w, torch.Tensor):
-                    valid_weights.append(w)
-                else:
-                    print(f"⚠️ Skipping invalid edge weights at index {i}")
-        else:
-            valid_weights.append(weights)
-
-        expected = num_nodes * (num_nodes - 1) // 2
-        if valid_weights:
-            weights = torch.stack(valid_weights).mean(dim=0)
+        try:
+            weights = adj_proc.compute_all_edge_weights(DC=DC, RC=RC).mean(dim=0)
+            expected = num_nodes * (num_nodes - 1) // 2
             if weights.numel() > expected:
                 weights = weights[:expected]
             elif weights.numel() < expected:
-                weights = torch.cat([weights, torch.zeros(expected - weights.numel())])
-        else:
-            print("⚠️ No valid edge weights found. Using default uniform weights.")
-            weights = torch.ones(expected)
+                weights = torch.cat([weights, torch.zeros(expected - weights.numel(), device=weights.device)])
+        except Exception as e:
+            print(f"[WARNING] Edge weight computation failed: {e}. Using uniform weights.")
+            weights = torch.ones(num_nodes * (num_nodes - 1) // 2)
 
         self.edge_index = edge_index.to(self.device)
         self.edge_attr = weights.to(self.device)
+
+        # Scalers for regression
         self.feature_scaler = None
         self.regression_scaler = None
-
+    
     @staticmethod
-    def safe_r2_score(y_true, y_pred):
-        y_true = np.array(y_true).flatten()
-        y_pred = np.array(y_pred).flatten()
-        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    def safe_r2_score(y_true, y_pred, verbose=False):
+        """
+        Compute a robust R² score for regression tasks, optimized for EEG data.
+
+        Args:
+            y_true (torch.Tensor): True target values.
+            y_pred (torch.Tensor): Predicted values.
+            verbose (bool): If True, print diagnostic information.
+
+        Returns:
+            float: R² score, capped at 0.0 to avoid negative values.
+        """
+        y_true = torch.as_tensor(y_true).flatten()
+        y_pred = torch.as_tensor(y_pred).flatten()
+        mask = torch.isfinite(y_true) & torch.isfinite(y_pred)
         y_true, y_pred = y_true[mask], y_pred[mask]
         if len(y_true) == 0:
+            if verbose:
+                print("No valid data after filtering NaNs/infs")
             return 0.0
-        ss_res = np.sum((y_true - y_pred) ** 2)
-        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-        if ss_tot <= 0 or np.isnan(ss_res):
+        y_true_mean = torch.mean(y_true)
+        y_true_std = torch.std(y_true, unbiased=False)
+        y_pred_mean = torch.mean(y_pred)
+        y_pred_std = torch.std(y_pred, unbiased=False)
+        epsilon = 1e-8
+        if y_true_std < epsilon or y_pred_std < epsilon:
+            if verbose:
+                print(f"Variance too low: y_true_std={y_true_std.item()}, y_pred_std={y_pred_std.item()}")
             return 0.0
-        return max(1 - ss_res / ss_tot, 0.0)
+        y_true = (y_true - y_true_mean) / (y_true_std + epsilon)
+        y_pred = (y_pred - y_pred_mean) / (y_pred_std + epsilon)
+        ss_res = torch.sum((y_true - y_pred) ** 2)
+        ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
+        if ss_tot <= epsilon or torch.isnan(ss_res):
+            if verbose:
+                print(f"Invalid SS_tot ({ss_tot.item()}) or SS_res is NaN")
+            return 0.0
+        r2 = 1 - ss_res / (ss_tot + epsilon)
+        return max(r2.item(), 0.0)
 
     def create_graph_batches(self, X, Y, task: str = None):
+        """
+        Build a PyTorch Geometric DataLoader from input features X and labels Y,
+        applying 30% data duplication (augmentation) for all tasks:
+            - detection, classification: average over time dimension.
+            - early_reg (forecast time): regression on (nodes, features).
+            - early_class (forecast label): classification on (nodes, features).
+        """
+        original_len = X.shape[0]
+        augment_count = max(1, int(original_len * 0.3)) if original_len > 1 else 0
+        print(f"[Before Augmentation] X: {original_len}, Y: {Y.shape[0]}")
+        if not isinstance(Y, torch.Tensor):
+            Y = torch.tensor(Y)
+        if augment_count > 0:
+            dup_indices = np.random.choice(original_len, size=augment_count, replace=True)
+            X_aug = X[dup_indices]
+            Y_aug = Y[dup_indices]
+            X = np.concatenate([X, X_aug], axis=0)
+            Y = torch.cat([Y, Y_aug], dim=0)
+        print(f"[After Augmentation] X: {X.shape[0]}, Y: {Y.shape[0]}")
         data_list = []
         for i in range(len(X)):
             x_np = X[i]
-            if task != "early_reg":
-                x_np = x_np.mean(axis=0)
+            if task not in ["early_reg", "early_class"]:
+                x_np = x_np.mean(axis=0)  # (nodes, features)
             x = torch.tensor(x_np, dtype=torch.float, device=self.device)
-
             y_val = Y[i]
             if task == "early_reg":
-                y = torch.tensor(y_val, dtype=torch.float, device=self.device)
+                y = y_val.clone().detach().to(dtype=torch.float, device=self.device)
             else:
-                y = torch.tensor(y_val, dtype=torch.long, device=self.device)
-
+                y = y_val.clone().detach().to(dtype=torch.long, device=self.device)
             if i < 3:
                 print(f"[{i}] Label: {y_val} -> Tensor: {y.item()}")
-
-            data_list.append(Data(
+            data = Data(
                 x=x,
                 edge_index=self.edge_index,
-                edge_attr=self.edge_attr,
                 y=y
-            ))
-
+            )
+            if hasattr(self, 'edge_attr') and self.edge_attr is not None:
+                data.edge_attr = self.edge_attr
+            data_list.append(data)
         return DataLoader(data_list, batch_size=self.batch_size, shuffle=True)
 
     def train(
@@ -608,41 +947,42 @@ class Trainer:
         detection: bool = False,
         classification: bool = False,
         early_reg: bool = False,
-        early_clf: bool = False,
-        test_size: float = 0.2,
-        random_state: int = 42
+        early_clf: bool = False
     ):
         os.makedirs("models/checkpoints", exist_ok=True)
 
+        # Debug input shapes and model parameters
+        print(f"[DEBUG] Input X shape: {np.array(X).shape}")
+        print(f"[DEBUG] Input Y shape: {np.array(Y).shape}")
+        print(f"[DEBUG] Model conv1 weight shape: {self.model.conv1.lin.weight.shape}")
+
+        # Prepare data loaders
         if early_reg:
             X = np.array(X)
             Y = np.array(Y)
             Y = np.maximum(Y, 1e-3)
-            X_mean = X.mean(axis=1)
+            X_mean = X.mean(axis=1)  # (N, nodes, features)
             N, nodes, feats = X_mean.shape
+            print(f"[DEBUG] X_mean shape: {X_mean.shape}, nodes: {nodes}, feats: {feats}")
             X_flat = X_mean.reshape(N, -1)
-
             X_train, X_val, Y_train, Y_val = train_test_split(
-                X_flat, Y, test_size=test_size, random_state=random_state
+                X_flat, Y, test_size=0.2, random_state=42
             )
             self.feature_scaler = StandardScaler()
             X_train = self.feature_scaler.fit_transform(X_train)
             X_val = self.feature_scaler.transform(X_val)
-
             Y_log = np.log1p(Y_train).reshape(-1, 1)
             self.regression_scaler = StandardScaler()
             Y_train_scaled = self.regression_scaler.fit_transform(Y_log).flatten()
             Y_val_scaled = self.regression_scaler.transform(
                 np.log1p(Y_val).reshape(-1, 1)
             ).flatten()
-
             train_loader = self.create_graph_batches(
                 X_train.reshape(-1, nodes, feats), Y_train_scaled, task="early_reg"
             )
             val_loader = self.create_graph_batches(
                 X_val.reshape(-1, nodes, feats), Y_val_scaled, task="early_reg"
             )
-
             print("=================== Early Regression ===================")
             self.optimizer = optim.Adam(
                 self.model.parameters(), lr=1e-4, weight_decay=0.0
@@ -657,26 +997,14 @@ class Trainer:
                 "classification" if classification else
                 "early_clf"
             )
-
-            stratify = Y if (classification or early_clf) else None
-            idx = np.arange(len(X))
-            train_idx, val_idx = train_test_split(
-                idx, test_size=test_size, random_state=random_state, stratify=stratify
-            )
-            X_train = [X[i] for i in train_idx]
-            Y_train = [Y[i] for i in train_idx]
-            X_val   = [X[i] for i in val_idx]
-            Y_val   = [Y[i] for i in val_idx]
-
-            train_loader = self.create_graph_batches(X_train, Y_train, task=task)
-            val_loader = self.create_graph_batches(X_val, Y_val, task=task)
-
+            train_loader = self.create_graph_batches(X, Y, task=task)
             print(f"=================== {task.capitalize()} ===================")
             self.optimizer = optim.Adam(
                 self.model.parameters(), lr=self.base_lr, weight_decay=self.base_wd
             )
             self.scheduler = StepLR(self.optimizer, step_size=10, gamma=0.5)
 
+        # Training loop
         for epoch in range(1, self.num_epochs + 1):
             self.model.train()
             epoch_loss = 0.0
@@ -686,24 +1014,37 @@ class Trainer:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
 
+                # Forward + loss + preds
                 if detection:
-                    out = self.model(batch.x, batch.edge_index, batch, task="detection").view(-1)
-                    loss = F.binary_cross_entropy_with_logits(out, batch.y.float())
+                    out, _ = self.model(
+                        batch.x, batch.edge_index, batch.batch, task="detection"
+                    )
+                    out = out.view(-1)
+                    loss = F.binary_cross_entropy_with_logits(
+                        out, batch.y.float()
+                    )
                     preds = (torch.sigmoid(out) > 0.5).cpu().numpy()
                     labels = batch.y.cpu().numpy()
                 elif classification:
-                    out = self.model(batch.x, batch.edge_index, batch, task="classification")
-                    loss = F.cross_entropy(out, batch.y)
+                    out, _ = self.model(
+                        batch.x, batch.edge_index, batch.batch, task="classification"
+                    )
+                    loss = self.criterion(out, batch.y)  # Use FocalLoss
                     preds = out.argmax(dim=1).cpu().numpy()
                     labels = batch.y.cpu().numpy()
                 elif early_reg:
-                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_time").view(-1)
+                    out, _ = self.model(
+                        batch.x, batch.edge_index, batch.batch, task="forecast_time"
+                    )
+                    out = out.view(-1)
                     loss = F.smooth_l1_loss(out, batch.y.float())
                     preds = out.detach().cpu().numpy()
                     labels = batch.y.cpu().numpy()
-                else:
-                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_label")
-                    loss = F.cross_entropy(out, batch.y)
+                else:  # early_clf
+                    out, _ = self.model(
+                        batch.x, batch.edge_index, batch.batch, task="forecast_label"
+                    )
+                    loss = self.criterion(out, batch.y)  # Use FocalLoss
                     preds = out.argmax(dim=1).cpu().numpy()
                     labels = batch.y.cpu().numpy()
 
@@ -715,60 +1056,74 @@ class Trainer:
 
             avg_loss = epoch_loss / len(train_loader)
 
+            # Metrics & scheduler
             if early_reg:
-                inv_preds = np.expm1(self.regression_scaler.inverse_transform(np.array(all_preds).reshape(-1, 1))).flatten()
-                inv_true = np.expm1(self.regression_scaler.inverse_transform(np.array(all_labels).reshape(-1, 1))).flatten()
+                inv_preds = np.expm1(
+                    self.regression_scaler.inverse_transform(
+                        np.array(all_preds).reshape(-1, 1)
+                    )
+                ).flatten()
+                inv_true = np.expm1(
+                    self.regression_scaler.inverse_transform(
+                        np.array(all_labels).reshape(-1, 1)
+                    )
+                ).flatten()
                 train_r2 = self.safe_r2_score(inv_true, inv_preds)
                 train_rmse = np.sqrt(mean_squared_error(inv_true, inv_preds))
-
                 self.model.eval()
                 val_preds, val_true = [], []
                 with torch.no_grad():
                     for batch in val_loader:
                         batch = batch.to(self.device)
-                        out = self.model(batch.x, batch.edge_index, batch, task="forecast_time").view(-1).cpu().numpy()
-                        p = np.expm1(self.regression_scaler.inverse_transform(out.reshape(-1, 1))).flatten()
-                        t = np.expm1(self.regression_scaler.inverse_transform(batch.y.cpu().numpy().reshape(-1, 1))).flatten()
+                        out, _ = self.model(
+                            batch.x, batch.edge_index, batch.batch, task="forecast_time"
+                        )
+                        out = out.view(-1).cpu().numpy()
+                        p = np.expm1(
+                            self.regression_scaler.inverse_transform(
+                                out.reshape(-1, 1)
+                            )
+                        ).flatten()
+                        t = np.expm1(
+                            self.regression_scaler.inverse_transform(
+                                batch.y.cpu().numpy().reshape(-1, 1)
+                            )
+                        ).flatten()
                         val_preds.extend(p)
                         val_true.extend(t)
-
                 val_r2 = self.safe_r2_score(val_true, val_preds)
                 val_rmse = np.sqrt(mean_squared_error(val_true, val_preds))
-
-                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f} | Val R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}")
+                print(
+                    f"Epoch {epoch}/{self.num_epochs} - "
+                    f"Loss: {avg_loss:.4f} | "
+                    f"Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f} | "
+                    f"Val   R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}"
+                )
                 self.scheduler.step(val_r2)
             else:
-                acc = accuracy_score(all_labels, all_preds)
-
-                self.model.eval()
-                v_preds, v_labels = [], []
-                with torch.no_grad():
-                    for batch in val_loader:
-                        batch = batch.to(self.device)
-                        if detection:
-                            out = self.model(batch.x, batch.edge_index, batch, task="detection").view(-1)
-                            v_preds.extend((torch.sigmoid(out) > 0.5).cpu().numpy())
-                            v_labels.extend(batch.y.cpu().numpy())
-                        elif classification:
-                            out = self.model(batch.x, batch.edge_index, batch, task="classification")
-                            v_preds.extend(out.argmax(dim=1).cpu().numpy())
-                            v_labels.extend(batch.y.cpu().numpy())
-                        else:
-                            out = self.model(batch.x, batch.edge_index, batch, task="forecast_label")
-                            v_preds.extend(out.argmax(dim=1).cpu().numpy())
-                            v_labels.extend(batch.y.cpu().numpy())
-                val_acc = accuracy_score(v_labels, v_preds)
-
-                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | Acc: {acc:.4f} | Val Acc: {val_acc:.4f}")
+                acc = accuracy_score(all_labels, all_labels)
+                print(
+                    f"Epoch {epoch}/{self.num_epochs} - "
+                    f"Loss: {avg_loss:.4f} | Acc: {acc:.4f}"
+                )
                 if isinstance(self.scheduler, ReduceLROnPlateau):
-                    self.scheduler.step(val_acc)
+                    self.scheduler.step(acc)
                 else:
                     self.scheduler.step()
 
-            tag = "detection" if detection else "classification" if classification else "early_reg" if early_reg else "early_clf"
+            # Checkpointing
+            tag = (
+                "detection" if detection else
+                "classification" if classification else
+                "early_reg" if early_reg else
+                "early_clf"
+            )
             ckpt_dir = f"models/checkpoints/{tag}"
             os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, f"{tag}_epoch_{epoch}.pth"))
+            torch.save(
+                self.model.state_dict(),
+                os.path.join(ckpt_dir, f"{tag}_epoch_{epoch}.pth")
+            )
 
         print("Training complete!")
         return all_preds
