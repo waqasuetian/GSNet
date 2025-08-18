@@ -1127,3 +1127,689 @@ class Trainer:
 
         print("Training complete!")
         return all_preds
+
+
+#version 2
+
+
+import os
+import warnings
+from typing import List
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+from models.model import MultiTaskGCN
+from data.scripts.adjacancy_matrics import AdjacencyMatrixProcessor
+
+
+# =========================
+# Task-aware feature builder
+# =========================
+class FeatureBuilder:
+    """
+    Builds task-specific per-node features from RFFT (log-amplitude) bins.
+    Assumes 200 Hz, 1 s => 100 bins (DC dropped). Adds compact spectral summaries.
+    DC tasks:     [100 bins] + [bandpowers, relative bandpowers, ratios, entropy] = 100 + 14 = 114
+    RC tasks:     mean⊕std over time => 200, plus the same compact summary = 214
+    """
+    BANDS = {"delta": (1, 4), "theta": (4, 8), "alpha": (8, 13), "beta": (13, 30), "gamma": (30, 70)}
+
+    def __init__(self, fs=200, rfft_bins=100):
+        self.fs = fs
+        self.rfft_bins = rfft_bins  # 1..100 Hz after DC drop
+
+    def _band_indices(self, lo, hi):
+        lo = max(1, int(np.floor(lo)))
+        hi = min(self.rfft_bins, int(np.floor(hi)))
+        return slice(lo - 1, hi)  # zero-based for numpy
+
+    def _bandpowers(self, x_bins):
+        # x_bins: (..., 100) log amplitude → convert back to magnitude before band sums
+        p_lin = np.exp(x_bins)
+        out = {}
+        for k, (lo, hi) in self.BANDS.items():
+            s = self._band_indices(lo, hi)
+            out[f"bp_{k}"] = p_lin[..., s].sum(axis=-1, keepdims=True)
+        out["bp_total"] = p_lin.sum(axis=-1, keepdims=True)
+        # relative
+        for k in list(self.BANDS.keys()):
+            out[f"rp_{k}"] = out[f"bp_{k}"] / np.maximum(out["bp_total"], 1e-12)
+        # simple ratios
+        out["ratio_alpha_theta"] = out["bp_alpha"] / np.maximum(out["bp_theta"], 1e-12)
+        out["ratio_beta_alpha"] = out["bp_beta"] / np.maximum(out["bp_alpha"], 1e-12)
+        return out  # each (..., 1)
+
+    def _spectral_entropy(self, x_bins):
+        p = np.exp(x_bins)
+        p = p / np.maximum(p.sum(axis=-1, keepdims=True), 1e-12)
+        ent = -(p * np.log(np.maximum(p, 1e-12))).sum(axis=-1, keepdims=True)
+        return ent
+
+    @staticmethod
+    def expected_out_dim_dc(in_bins=100):
+        # 100 bins + 5 bp + 1 total + 5 rel + 2 ratios + 1 entropy = 114
+        return in_bins + 14
+
+    @staticmethod
+    def expected_out_dim_rc(in_bins=100):
+        # mean (100) + std (100) + 14 summary = 214
+        return 2 * in_bins + 14
+
+    def build(self, X, mode: str):
+        """
+        X: (N, T, V, F). For DC, F should be 100 log-RFFT bins (DC dropped).
+           For RC, F should be 100 per timestep; we compute mean⊕std over T here.
+        Returns:
+            DC modes: (N, T, V, 114)
+            RC modes: (N, 1, V, 214)   (T collapsed)
+        """
+        assert X.ndim == 4, f"Expected 4D (N,T,V,F), got {X.shape}"
+        N, T, V, F = X.shape
+
+        if mode in ("detection", "classification"):
+            if F != 100:
+                warnings.warn(f"[FeatureBuilder] Expected F=100 RFFT bins for DC; got F={F}. Proceeding.")
+            bp = self._bandpowers(X)                      # dict of (N,T,V,1)
+            ent = self._spectral_entropy(X)               # (N,T,V,1)
+            summary = np.concatenate([*bp.values(), ent], axis=-1)  # (N,T,V,14)
+            return np.concatenate([X, summary], axis=-1)            # (N,T,V,114)
+
+        else:  # early_reg / early_clf
+            if F != 100:
+                warnings.warn(f"[FeatureBuilder] Expected F=100 RFFT bins for RC; got F={F}. Proceeding.")
+            X_mean = X.mean(axis=1)                       # (N,V,100)
+            X_std = X.std(axis=1)                         # (N,V,100)
+            bp = self._bandpowers(X_mean)                 # dict of (N,V,1)
+            ent = self._spectral_entropy(X_mean)          # (N,V,1)
+            summary = np.concatenate([*bp.values(), ent], axis=-1)  # (N,V,14)
+            feats = np.concatenate([X_mean, X_std, summary], axis=-1)  # (N,V,214)
+            return feats[:, None, ...]                    # (N,1,V,214)
+
+
+# ---------------------------
+# Feature name helper for CSV
+# ---------------------------
+def make_feature_names(is_rc: bool, rfft_bins: int = 100):
+    """
+    Returns a list of per-node feature names in the same order used by FeatureBuilder.
+    DC  -> 100 RFFT bins + 14 summary = 114
+    RC  -> 100 mean + 100 std + 14 summary = 214
+    """
+    bands = ["delta", "theta", "alpha", "beta", "gamma"]
+    bp = [f"bp_{b}" for b in bands] + ["bp_total"]
+    rp = [f"rp_{b}" for b in bands]
+    ratios = ["ratio_alpha_theta", "ratio_beta_alpha"]
+    summary = bp + rp + ratios + ["spec_entropy"]
+
+    if not is_rc:
+        core = [f"rfft_bin_{i}" for i in range(1, rfft_bins + 1)]
+        return core + summary
+    else:
+        mean_feats = [f"mean_bin_{i}" for i in range(1, rfft_bins + 1)]
+        std_feats = [f"std_bin_{i}" for i in range(1, rfft_bins + 1)]
+        return mean_feats + std_feats + summary
+
+
+# ===========================
+# Adaptive, head-aware losses
+# ===========================
+class AdaptiveHeadLoss(torch.nn.Module):
+    def __init__(self, smoothing=0.05, focal_gamma=2.0):
+        super().__init__()
+        self.smoothing = smoothing
+        self.focal_gamma = focal_gamma
+        self.reg_running_mad = None  # scale-invariant normalization
+
+    def _label_smooth_ce(self, logits, targets, num_classes, smoothing):
+        with torch.no_grad():
+            true_dist = torch.zeros_like(logits)
+            true_dist.fill_(smoothing / max(1, (num_classes - 1)))
+            true_dist.scatter_(1, targets.unsqueeze(1), 1 - smoothing)
+        logp = torch.log_softmax(logits, dim=1)
+        return -(true_dist * logp).sum(dim=1).mean()
+
+    def _focal_from_ce(self, ce_per_sample, gamma):
+        pt = torch.exp(-ce_per_sample)
+        return ((1 - pt) ** gamma * ce_per_sample).mean()
+
+    def detection_loss(self, logits, y):
+        # BCE with adaptive pos_weight from batch balance
+        p = y.mean().clamp_min(1e-6)
+        pos_weight = (1 - p) / p
+        return F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight)
+
+    def classification_loss(self, logits, y, num_classes):
+        with torch.no_grad():
+            ce_per = F.cross_entropy(logits, y, reduction='none')
+        ls_ce = self._label_smooth_ce(logits, y, num_classes, self.smoothing)
+        focal = self._focal_from_ce(ce_per, self.focal_gamma)
+        return 0.5 * ls_ce + 0.5 * focal
+
+    def regression_loss(self, pred, y):
+        # SmoothL1 with adaptive delta (IQR/2) and scale-invariant division by running MAD
+        with torch.no_grad():
+            if y.numel() >= 4:
+                q1, q3 = torch.quantile(y, 0.25), torch.quantile(y, 0.75)
+                delta = torch.clamp((q3 - q1) / 2.0, min=0.1)
+            else:
+                delta = torch.tensor(1.0, device=y.device)
+            mad = torch.median(torch.abs(y - torch.median(y)))
+            if self.reg_running_mad is None:
+                self.reg_running_mad = mad
+            else:
+                self.reg_running_mad = 0.9 * self.reg_running_mad + 0.1 * mad
+            scale = torch.clamp(self.reg_running_mad, min=1e-3)
+        loss = F.smooth_l1_loss(pred, y, beta=float(delta))
+        return loss / scale
+
+
+class Trainer:
+    def __init__(
+        self,
+        num_features: int,
+        num_hiddens: int,
+        num_classes: int,
+        dropout: float,
+        num_heads: int,
+        learning_rate: float,
+        batch_size: int,
+        num_epochs: int,
+        pooled_results,
+        DC: bool = False,
+        RC: bool = False
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.base_lr = learning_rate
+        self.base_wd = 0.0
+
+        # Determine expected input dim per task *before* model init (based on FeatureBuilder)
+        if RC:
+            in_dim = FeatureBuilder.expected_out_dim_rc(num_features)   # 214 if num_features=100
+        else:
+            in_dim = FeatureBuilder.expected_out_dim_dc(num_features)   # 114 if num_features=100
+
+        self.model = MultiTaskGCN(
+            hidden_dim=num_hiddens,
+            in_dim=in_dim,
+            num_classes=num_classes,
+            dropout=dropout
+        ).to(self.device)
+
+        self.adaptive_loss = AdaptiveHeadLoss(smoothing=0.05, focal_gamma=2.0)
+
+        # ----- Graph topology & weights -----
+        self.num_nodes = 19
+        base_edge_index = torch.tril_indices(self.num_nodes, self.num_nodes, offset=-1)
+        expected_pairs = self.num_nodes * (self.num_nodes - 1) // 2  # 171 for n=19
+
+        adj_proc = AdjacencyMatrixProcessor(pooled_results, data_directory=r"G:\tuh_data\train")
+
+        # NOTE: get raw weights as returned (do NOT average before we know the shape)
+        raw = adj_proc.compute_all_edge_weights(DC=not RC, RC=RC)  # shape: [B,E] or [] or [B,190] etc.
+
+        def _coerce_to_offdiag_lower_tri_1d(w: torch.Tensor, n: int) -> torch.Tensor | None:
+            """
+            Accepts:
+            - [E] where E ∈ {n(n-1)/2, n(n+1)/2, n*n}
+            - [B,E] or [B,n(n+1)/2] or [B,n*n]
+            Returns:
+            - [n(n-1)/2] off-diagonal lower-tri vector, averaged across batch if needed
+            """
+            if w.ndim == 1:
+                num = w.numel()
+                if num == n * (n - 1) // 2:
+                    return w  # already offdiag lower-tri
+                if num == n * (n + 1) // 2:
+                    # drop diagonal
+                    r0, c0 = torch.tril_indices(n, n, offset=0)
+                    mask = (r0 != c0)
+                    return w[mask]
+                if num == n * n:
+                    W = w.view(n, n)
+                    r, c = torch.tril_indices(n, n, offset=-1)
+                    return W[r, c]
+                return None
+
+            # Average any leading batch dims → [E]
+            lead_dims = tuple(range(0, w.ndim - 1))
+            w1 = w.mean(dim=lead_dims)
+
+            # Recurse on 1D
+            return _coerce_to_offdiag_lower_tri_1d(w1, n)
+
+        # ---- Debug: show raw type/shape
+        print("[DEBUG] type(raw):", type(raw))
+        if isinstance(raw, torch.Tensor):
+            print("[DEBUG] raw.shape:", tuple(raw.shape), "dtype:", raw.dtype)
+
+        # ---- Build final weights
+        if isinstance(raw, torch.Tensor) and raw.numel() > 0:
+            weights = _coerce_to_offdiag_lower_tri_1d(raw, self.num_nodes)
+            if weights is None:
+                print("⚠️ Could not coerce edge weights; using uniform.")
+                weights = torch.ones(expected_pairs, dtype=torch.float32)
+            else:
+                # Safety: exact length
+                if weights.numel() != expected_pairs:
+                    print(f"⚠️ Edge weight length {weights.numel()} != expected {expected_pairs}. "
+                        "Truncating/padding for safety.")
+                    if weights.numel() > expected_pairs:
+                        weights = weights[:expected_pairs]
+                    else:
+                        weights = torch.cat([weights, torch.zeros(expected_pairs - weights.numel(), dtype=weights.dtype)])
+        else:
+            print("⚠️ No valid edge weights found. Using default uniform weights.")
+            weights = torch.ones(expected_pairs, dtype=torch.float32)
+
+        # ---- Undirected graph & device move
+        self.edge_index, self.edge_weight = self._make_undirected(base_edge_index, weights)
+        self.edge_index = self.edge_index.to(self.device)
+        self.edge_weight = self.edge_weight.to(self.device)
+
+        # Scalers
+        self.feature_scaler = None
+        self.regression_scaler = None
+
+
+    @staticmethod
+    def _make_undirected(edge_index, edge_weight=None):
+        ei_rev = edge_index[[1, 0], :]
+        edge_index_ud = torch.cat([edge_index, ei_rev], dim=1)
+        if edge_weight is not None:
+            ew_ud = torch.cat([edge_weight, edge_weight], dim=0)
+        else:
+            ew_ud = None
+        return edge_index_ud, ew_ud
+
+    @staticmethod
+    def safe_r2_score(y_true, y_pred, verbose=False):
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.cpu().numpy()
+        if isinstance(y_pred, torch.Tensor):
+            y_pred = y_pred.cpu().numpy()
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        y_true, y_pred = y_true[mask], y_pred[mask]
+        if len(y_true) == 0:
+            if verbose:
+                warnings.warn("No valid data after filtering NaNs/infs")
+            return 0.0
+
+        if verbose:
+            print(f"Number of valid samples: {len(y_true)}")
+            print(f"y_true stats: min={y_true.min():.4f}, max={y_true.max():.4f}, mean={y_true.mean():.4f}, std={y_true.std():.4f}")
+            print(f"y_pred stats: min={y_pred.min():.4f}, max={y_pred.max():.4f}, mean={y_pred.mean():.4f}, std={y_pred.std():.4f}")
+
+        if np.var(y_true) == 0:
+            if verbose:
+                print("Warning: y_true has zero variance. R² is undefined.")
+            return 0.0
+
+        r2 = r2_score(y_true, y_pred)
+        return max(r2, 0.0)
+
+    @staticmethod
+    def _oversample(X, Y, factor=3.0):
+        n = X.shape[0]
+        if n <= 1 or factor <= 1.0:
+            return X, Y
+        dup = max(1, int(n * (factor - 1.0)))
+        idx = np.random.choice(n, size=dup, replace=True)
+        return np.concatenate([X, X[idx]], axis=0), np.concatenate([Y, Y[idx]], axis=0)
+
+    def create_graph_batches(self, X, Y, task: str = None):
+        """
+        X: (N, V, F)  — per-graph node features (time already pooled)
+        Y: (N,)
+        """
+        data_list = []
+        for i in range(len(X)):
+            x_np = X[i]
+            if x_np.shape[0] != self.num_nodes and x_np.shape[1] == self.num_nodes:
+                x_np = x_np.T
+            if x_np.shape[0] != self.num_nodes:
+                raise ValueError(f"Expected {self.num_nodes} nodes, got {x_np.shape[0]} in X[{i}] for task {task}")
+            x = torch.tensor(x_np, dtype=torch.float32, device=self.device)
+
+            y_val = Y[i]
+            if task in ("early_reg", "detection"):
+                y = torch.as_tensor(y_val, dtype=torch.float32, device=self.device)
+            else:
+                y = torch.as_tensor(y_val, dtype=torch.long, device=self.device)
+
+            data = Data(x=x, edge_index=self.edge_index, y=y)
+            if self.edge_weight is not None:
+                data.edge_weight = self.edge_weight
+            data_list.append(data)
+
+        return DataLoader(data_list, batch_size=self.batch_size, shuffle=True)
+
+    # -------------
+    # Interpretability
+    # -------------
+    def visualize_input_graph(self, save_path="graph_input.png", threshold=0.0):
+        import networkx as nx
+        import matplotlib.pyplot as plt
+        ei = self.edge_index.detach().cpu().numpy()
+        ew = self.edge_weight.detach().cpu().numpy() if self.edge_weight is not None else np.ones(ei.shape[1])
+        G = nx.Graph()
+        for (u, v), w in zip(ei.T, ew):
+            if w >= threshold:
+                G.add_edge(int(u), int(v), weight=float(w))
+        pos = nx.spring_layout(G, seed=42)
+        widths = [G[u][v]['weight'] / (ew.max() + 1e-8) * 3.0 for u, v in G.edges()]
+        plt.figure(figsize=(6, 6))
+        nx.draw(G, pos, with_labels=True, width=widths, node_size=420)
+        plt.title("Input EEG Graph (edge width ∝ weight)")
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.tight_layout(); plt.savefig(save_path); plt.close()
+        print(f"[viz] saved {save_path}")
+
+    def explain_one_batch(self, loader, task="classification", save_path="explain.png", csv_prefix=None):
+        """
+        Saves: a PNG plot, plus CSVs:
+          - {csv_prefix}_feature_importance.csv
+          - {csv_prefix}_edge_importance.csv
+          - {csv_prefix}_node_importance.csv
+        Uses new PyG API: no epochs in __init__; pass epochs to explain_graph().
+        """
+        from torch_geometric.explain import GNNExplainer
+        import matplotlib.pyplot as plt
+        import networkx as nx
+        import csv
+        import os
+        
+        self.model.eval()
+        batch = next(iter(loader))
+        batch = batch.to(self.device)
+
+        # Decide return_type per task/head
+        # - 'regression' for scalar heads (detection logit, forecast_time)
+        # - 'classification' for multi-class heads (classification, forecast_label)
+        if task in ["detection", "early_reg", "forecast_time"]:
+            return_type = "regression"
+        else:
+            return_type = "classification"
+
+        def forward_for_explain(x, edge_index):
+            return self.model(x, edge_index, batch, task=task, edge_weight=getattr(batch, "edge_weight", None))
+
+        # New API: no epochs in __init__
+        explainer = GNNExplainer(self.model, return_type=return_type)
+
+        # Pass epochs here
+        node_feat_mask, edge_mask = explainer.explain_graph(
+            x=batch.x, edge_index=batch.edge_index, forward=forward_for_explain, epochs=200
+        )
+
+        # ---- Plot edge importance graph
+        ei = batch.edge_index.detach().cpu().numpy()
+        em = edge_mask.detach().cpu().numpy()
+        G = nx.Graph()
+        for (u, v), w in zip(ei.T, em):
+            G.add_edge(int(u), int(v), weight=float(w))
+        pos = nx.spring_layout(G, seed=7)
+        widths = [G[u][v]['weight'] / (em.max() + 1e-8) * 3.0 for u, v in G.edges()]
+        plt.figure(figsize=(6, 6))
+        nx.draw(G, pos, with_labels=True, width=widths, node_size=420)
+        plt.title(f"GNNExplainer — edge importance ({task})")
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.tight_layout(); plt.savefig(save_path); plt.close()
+        print(f"[explain] plot saved {save_path}")
+
+        # ---- CSV exports
+        prefix = csv_prefix or os.path.splitext(save_path)[0]
+
+        # 1) Feature importance (global mask over node features)
+        feat_mask = node_feat_mask.detach().cpu().numpy().reshape(-1)
+        is_rc = (task in ["early_reg", "forecast_time", "early_clf", "forecast_label"])
+        feat_names = make_feature_names(is_rc=is_rc, rfft_bins=100)
+        L = min(len(feat_names), len(feat_mask))
+        rows = list(zip(range(L), feat_names[:L], feat_mask[:L]))
+        with open(f"{prefix}_feature_importance.csv", "w", newline="") as f:
+            w = csv.writer(f); w.writerow(["feature_index", "feature_name", "importance"])
+            w.writerows(rows)
+        print(f"[explain] feature importances -> {prefix}_feature_importance.csv")
+
+        # 2) Edge importance
+        with open(f"{prefix}_edge_importance.csv", "w", newline="") as f:
+            w = csv.writer(f); w.writerow(["u", "v", "importance"])
+            for (u, v), wgt in zip(ei.T, em):
+                w.writerow([int(u), int(v), float(wgt)])
+        print(f"[explain] edge importances -> {prefix}_edge_importance.csv")
+
+        # 3) Node importance (sum of incident edge importances as a proxy)
+        node_scores = np.zeros(self.num_nodes, dtype=float)
+        for (u, v), wgt in zip(ei.T, em):
+            node_scores[int(u)] += float(wgt)
+            node_scores[int(v)] += float(wgt)
+        with open(f"{prefix}_node_importance.csv", "w", newline="") as f:
+            w = csv.writer(f); w.writerow(["node_index", "importance_sum_incident_edges"])
+            for i, s in enumerate(node_scores):
+                w.writerow([i, s])
+        print(f"[explain] node importances -> {prefix}_node_importance.csv")
+
+    # -------------
+    # Training
+    # -------------
+    def train(
+        self,
+        X,
+        Y,
+        detection: bool = False,
+        classification: bool = False,
+        early_reg: bool = False,
+        early_clf: bool = False,
+        explain_after: bool = False,          # NEW
+        explain_path: str | None = None       # NEW
+    ):
+        os.makedirs("models/checkpoints", exist_ok=True)
+
+        X = np.array(X)  # (N,T,V,F)
+        Y = np.array(Y)
+
+        # ---- Task-aware feature categorization ----
+        fb = FeatureBuilder(fs=200, rfft_bins=100)
+        task = "detection" if detection else "classification" if classification else "early_reg" if early_reg else "early_clf"
+        X_feat = fb.build(X, mode=task)        # DC: (N,T,V,114) ; RC: (N,1,V,214)
+
+        # Reduce time to per-graph features
+        X_graph = X_feat.mean(axis=1)          # (N,V,Fout)
+
+        # ---- Split ----
+        X_train, X_val, Y_train, Y_val = train_test_split(
+            X_graph, Y, test_size=0.2, random_state=42, stratify=Y if not early_reg else None
+        )
+
+        # ---- Scale features ----
+        self.feature_scaler = StandardScaler()
+        X_train_rs = X_train.reshape(-1, X_train.shape[-1])
+        X_val_rs   = X_val.reshape(-1, X_val.shape[-1])
+        X_train_sc = self.feature_scaler.fit_transform(X_train_rs).reshape(X_train.shape)
+        X_val_sc   = self.feature_scaler.transform(X_val_rs).reshape(X_val.shape)
+
+        # ---- Scale regression targets (log1p + StandardScaler)
+        if early_reg:
+            self.regression_scaler = StandardScaler()
+            Y_train_sc = self.regression_scaler.fit_transform(np.log1p(Y_train).reshape(-1, 1)).flatten()
+            Y_val_sc   = self.regression_scaler.transform(np.log1p(Y_val).reshape(-1, 1)).flatten()
+        else:
+            Y_train_sc = Y_train
+            Y_val_sc   = Y_val
+
+        # ---- Oversample (train only) for classification-like tasks ----
+        X_tr, Y_tr = X_train_sc, Y_train_sc
+        X_va, Y_va = X_val_sc,   Y_val_sc
+        if detection or classification or early_clf:
+            X_tr, Y_tr = self._oversample(X_tr, Y_tr, factor=3.0)
+
+        # ---- Build loaders (no augmentation inside) ----
+        train_loader = self.create_graph_batches(X_tr, Y_tr, task=task)
+        val_loader   = self.create_graph_batches(X_va, Y_va, task=task)
+
+        print(f"=================== {task.capitalize()} ===================")
+
+        # ---- Optim/sched ----
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=0.001 if early_reg else self.base_lr,
+            weight_decay=1e-5 if early_reg else self.base_wd
+        )
+        self.scheduler = (
+            ReduceLROnPlateau(self.optimizer, mode="max", factor=0.3, patience=15, min_lr=1e-7)
+            if early_reg else
+            StepLR(self.optimizer, step_size=10, gamma=0.5)
+        )
+
+        best_val_metric = -float("inf")
+        patience_counter = 0
+        early_stopping_patience = 100
+
+        # ---- Epoch loop ----
+        for epoch in range(1, self.num_epochs + 1):
+            self.model.train()
+            epoch_loss = 0.0
+            all_preds, all_labels = [], []
+
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+                ew = getattr(batch, "edge_weight", None)
+
+                if detection:
+                    out = self.model(batch.x, batch.edge_index, batch, task="detection", edge_weight=ew).squeeze(-1)
+                    loss = self.adaptive_loss.detection_loss(out, batch.y.float())
+                    preds = (torch.sigmoid(out) > 0.5).detach().cpu().numpy()
+                    labels = batch.y.detach().cpu().numpy()
+
+                elif classification:
+                    out = self.model(batch.x, batch.edge_index, batch, task="classification", edge_weight=ew)
+                    loss = self.adaptive_loss.classification_loss(out, batch.y,
+                                                                  num_classes=self.model.class_head[-1].out_features)
+                    preds = out.argmax(dim=1).detach().cpu().numpy()
+                    labels = batch.y.detach().cpu().numpy()
+
+                elif early_reg:
+                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_time", edge_weight=ew).squeeze(-1)
+                    loss = self.adaptive_loss.regression_loss(out, batch.y.float())
+                    preds = out.detach().cpu().numpy()
+                    labels = batch.y.detach().cpu().numpy()
+
+                else:  # early_clf
+                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_label", edge_weight=ew)
+                    loss = self.adaptive_loss.classification_loss(out, batch.y,
+                                                                  num_classes=self.model.label_head[-1].out_features)
+                    preds = out.argmax(dim=1).detach().cpu().numpy()
+                    labels = batch.y.detach().cpu().numpy()
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                epoch_loss += loss.item()
+                all_preds.extend(preds)
+                all_labels.extend(labels)
+
+            avg_loss = epoch_loss / max(1, len(train_loader))
+
+            # ---- Validation ----
+            self.model.eval()
+            val_preds, val_labels = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(self.device)
+                    ew = getattr(batch, "edge_weight", None)
+
+                    if detection:
+                        out = self.model(batch.x, batch.edge_index, batch, task="detection", edge_weight=ew).squeeze(-1)
+                        preds = (torch.sigmoid(out) > 0.5).cpu().numpy()
+                    elif classification:
+                        out = self.model(batch.x, batch.edge_index, batch, task="classification", edge_weight=ew)
+                        preds = out.argmax(dim=1).cpu().numpy()
+                    elif early_reg:
+                        out = self.model(batch.x, batch.edge_index, batch, task="forecast_time", edge_weight=ew).squeeze(-1).cpu().numpy()
+                        preds = np.expm1(self.regression_scaler.inverse_transform(out.reshape(-1, 1))).flatten()
+                    else:  # early_clf
+                        out = self.model(batch.x, batch.edge_index, batch, task="forecast_label", edge_weight=ew)
+                        preds = out.argmax(dim=1).cpu().numpy()
+
+                    val_preds.extend(preds)
+                    val_labels.extend(batch.y.detach().cpu().numpy())
+
+            # ---- Metrics ----
+            if early_reg:
+                inv_preds = np.expm1(self.regression_scaler.inverse_transform(np.array(all_preds).reshape(-1, 1))).flatten()
+                inv_true  = np.expm1(self.regression_scaler.inverse_transform(np.array(all_labels).reshape(-1, 1))).flatten()
+                verbose_debug = (epoch == 1)
+                train_r2  = self.safe_r2_score(inv_true, inv_preds, verbose=verbose_debug)
+                train_rmse = np.sqrt(mean_squared_error(inv_true, inv_preds))
+                val_r2   = self.safe_r2_score(val_labels, val_preds, verbose=verbose_debug)
+                val_rmse = np.sqrt(mean_squared_error(val_labels, val_preds))
+                val_metric = val_r2
+                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | "
+                      f"Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f} | "
+                      f"Val R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}")
+            else:
+                train_acc = accuracy_score(all_labels, all_preds)
+                val_acc   = accuracy_score(val_labels, val_preds)
+                val_metric = val_acc
+                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | "
+                      f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+
+            # ---- Checkpointing ----
+            tag = task
+            if val_metric > best_val_metric:
+                best_val_metric = val_metric
+                patience_counter = 0
+                torch.save(
+                    {
+                        "model_state_dict": self.model.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "scheduler_state_dict": None if isinstance(self.scheduler, ReduceLROnPlateau) else self.scheduler.state_dict(),
+                        "val_metric": best_val_metric,
+                        "epoch": epoch,
+                    },
+                    f"models/checkpoints/{tag}_best.pth"
+                )
+            else:
+                patience_counter += 1
+
+            if patience_counter >= early_stopping_patience:
+                print(f"Early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs).")
+                break
+
+            if isinstance(self.scheduler, ReduceLROnPlateau):
+                self.scheduler.step(val_metric)
+            else:
+                self.scheduler.step()
+
+            # epoch checkpoint (weights only)
+            ckpt_dir = f"models/checkpoints/{tag}"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, f"{tag}_epoch_{epoch}.pth"))
+
+        # Post-train explanation on the validation batch (optional)
+        if explain_after:
+            try:
+                csv_prefix = os.path.splitext(explain_path or f"explain_{task}.png")[0]
+                self.explain_one_batch(val_loader, task=task, save_path=explain_path or f"explain_{task}.png", csv_prefix=csv_prefix)
+            except Exception as e:
+                print(f"[explain] skipped due to error: {e}")
+
+        print("Training complete!")
+        return all_preds
+
+
