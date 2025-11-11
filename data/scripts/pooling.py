@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from data.scripts.data_loader import EEGProcessor 
+from data.scripts.data_loader_preictal import EEGProcessorPreictal
 import numpy as np
 
 class EEGPooler:
@@ -44,44 +45,93 @@ class EEGPooler:
         """
         Applies adaptive pooling to all EEG clips in results.
 
+        NEW: Works with file paths (lazy mode) or traditional results dict.
+
         Returns:
-            dict: Dictionary with pooled EEG clips and corresponding labels.
+            dict or list: Dictionary with pooled EEG clips and corresponding labels,
+                         OR list of file_path dicts if in lazy mode.
         """
+        # Check if results is a list of file paths (lazy mode)
+        if isinstance(self.results, list) and len(self.results) > 0:
+            if isinstance(self.results[0], dict) and 'h5_path' in self.results[0]:
+                print("Lazy loading mode detected - returning file paths")
+                return self.results  # Return paths unchanged for lazy loading
+
+        # Traditional mode - load everything
         pooled_results = {}
 
-        for key, (eeg_clips, labels, _, _, _) in self.results.items():
+        for key, (eeg_clips, labels, _,_,_) in self.results.items():
             pooled_clips = [self.adaptive_pool_clip(clip) for clip in eeg_clips]
             pooled_results[key] = (pooled_clips, labels)
 
         return pooled_results
 
+    # def apply_pooling_RC(self):
+    #     """
+    #     Applies adaptive pooling to all EEG clips in results.
+
+    #     Returns:
+    #         dict: Dictionary with pooled EEG clips, labels, start times, and stop times.
+    #     """
+    #     pooled_results = {}
+
+    #     for key, (eeg_clips, labels, start_times, stop_times) in self.results.items():
+    #         pooled_clips = [self.adaptive_pool_clip(clip) for clip in eeg_clips]
+    #         pooled_results[key] = (pooled_clips, labels, start_times, stop_times)
+
+    #     return pooled_results
+
+    
     def apply_pooling_RC(self):
         """
-        Applies adaptive pooling to all EEG clips in results.
+        Applies adaptive pooling to all EEG clips in results for RC tasks.
+
+        NEW: Works with file paths (lazy mode) or traditional results dict.
 
         Returns:
-            dict: Dictionary with pooled EEG clips, labels, start times, and stop times.
+            dict or list: Dictionary with pooled EEG clips, labels, start times, and stop times,
+                         OR list of file_path dicts if in lazy mode.
         """
+        # Check if results is a list of file paths (lazy mode)
+        if isinstance(self.results, list) and len(self.results) > 0:
+            if isinstance(self.results[0], dict) and 'h5_path' in self.results[0]:
+                print("Lazy loading mode detected - returning file paths")
+                return self.results  # Return paths unchanged for lazy loading
+
+        # Traditional mode - load everything
         pooled_results = {}
 
-        for key, (eeg_clips, labels, start_times, stop_times) in self.results.items():
-            pooled_clips = [self.adaptive_pool_clip(clip) for clip in eeg_clips]
-            pooled_results[key] = (pooled_clips, labels, start_times, stop_times)
+        for key, value in self.results.items():
+            try:
+                # Validate the input is a 4-element tuple
+                if not isinstance(value, tuple) or len(value) != 4:
+                    print(f"Skipping {key}: Invalid data format, expected 4-element tuple, got {value}")
+                    continue
+                eeg_clips, labels, start_times, stop_times = value
+                # Validate that all elements are lists and non-empty
+                if not (isinstance(eeg_clips, list) and isinstance(labels, list) and
+                        isinstance(start_times, list) and isinstance(stop_times, list)):
+                    print(f"Skipping {key}: Invalid data types: clips={type(eeg_clips)}, "
+                        f"labels={type(labels)}, start_times={type(start_times)}, "
+                        f"stop_times={type(stop_times)}")
+                    continue
+                if not (eeg_clips and labels and start_times and stop_times):
+                    print(f"Skipping {key}: Empty data: clips={len(eeg_clips)}, "
+                        f"labels={len(labels)}, start_times={len(start_times)}, "
+                        f"stop_times={len(stop_times)}")
+                    continue
+                # Ensure lengths match
+                if not (len(eeg_clips) == len(labels) == len(start_times) == len(stop_times)):
+                    print(f"Skipping {key}: Mismatched lengths: clips={len(eeg_clips)}, "
+                        f"labels={len(labels)}, start_times={len(start_times)}, "
+                        f"stop_times={len(stop_times)}")
+                    continue
+                # Apply pooling
+                pooled_clips = [self.adaptive_pool_clip(clip) for clip in eeg_clips]
+                pooled_results[key] = (pooled_clips, labels, start_times, stop_times)
+            except Exception as e:
+                print(f"Error pooling {key}: {e} (skipping)")
 
+        if not pooled_results:
+            print("Warning: No valid data after pooling. Check input files and preprocessing.")
         return pooled_results
-
-
-
-## Example usage
-
-
-
-# # Step 1: Process EEG files
-# directory = r'C:\Users\MyPC\AppData\Roaming\MobaXterm\slash\home\Documents\edf\train'
-# processor = EEGProcessor(directory, resampled_freq=200, time_step_size=1, apply_fft=True)
-# processor.convert_edf_to_h5()
-# results = processor.process_directory()
-
-# # Step 2: Apply Adaptive Pooling
-# pooler = EEGPooler(results, target_time_points=100)
-# pooled_results = pooler.apply_pooling()
