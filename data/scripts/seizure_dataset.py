@@ -173,4 +173,4 @@ class SeizureDataset(Dataset):
                 adj_mat_new[node_pair[0], node_pair[1]] = adj_mat[node_pair[1], node_pair[0]]
                 adj_mat_new[node_pair[1], node_pair[0]] = adj_mat[node_pair[0], node_pair[1]]
 
-        return adj_mat_new   
+        return adj_mat_new 
