@@ -1,3 +1,6 @@
+
+    
+
 import re
 import torch
 import numpy as np
@@ -21,7 +24,7 @@ def _parse_base_key(base: str):
 
 
 class preictal_dataLoader:
-    def __init__(self, pooled_results_dictionary, target_time_points=100, num_nodes=19,
+    def __init__(self, pooled_results_dictionary, target_time_points=10, num_nodes=19,
                  early_reg=True, early_label=False,
                  allow_intermediate_labels=None, max_gap_between_bckg_and_ictal_sec=0.0,
                  min_preictal_clip_sec=0.0,
@@ -31,9 +34,9 @@ class preictal_dataLoader:
                  reg_target_log: bool = True,
                  # optionally expand window in "auto" if adjacent+window find nothing
                  auto_expand_windows: tuple = (),            # e.g., (1200.0, 1800.0, 3600.0)
-                 lazy_loading: bool = False,                 # NEW: Enable lazy loading
-                 processor=None,                             # NEW: Required for lazy loading
-                 pooler=None):                               # NEW: Required for lazy loading
+                 lazy_loading: bool = False,                 # Enable lazy loading
+                 processor=None,                             # Required for lazy loading
+                 pooler=None):                               # Required for lazy loading
         """
         early_reg=True  -> regression on time-to-seizure (seconds)
         early_label=True -> classification of upcoming ictal type
@@ -51,7 +54,6 @@ class preictal_dataLoader:
         if early_reg == early_label:
             raise ValueError("Exactly one of early_reg or early_label must be True.")
 
-        # NEW: Check if lazy loading mode
         self.lazy_loading = lazy_loading
         self.processor = processor
         self.pooler = pooler
@@ -85,11 +87,10 @@ class preictal_dataLoader:
         self.y_scaler = None
         self.label_to_numeric = {"gnsz": 0, "fnsz": 1, "tcsz": 2, "absz": 3, "mysz": 4, "cpsz":5, "tnsz": 6}
 
-        # NEW: Process data differently based on mode
         if self.lazy_loading and self.file_paths is not None:
-            print("[LAZY MODE] Will process files incrementally in get_data()")
-            self.filtered_results = {}
-            self.preictal_dict = {}
+                print("[LAZY MODE] Will process files incrementally in get_data()")
+                self.filtered_results = {}
+                self.preictal_dict = {}
         else:
             # 1) normalize & sort per base
             self.filtered_results = self._filter_and_sort()
@@ -98,11 +99,12 @@ class preictal_dataLoader:
             self.preictal_dict = self._generate_preictal_dict()
 
             if self.early_reg:
-                self.x_reg, self.y_reg = self._prepare(mode="early_reg")
+                # UPDATED: Now receives 4 values
+                self.x_reg, self.y_reg, self.file_ids_reg, self.patient_ids_reg = self._prepare(mode="early_reg")
             else:
-                self.x_clf, self.y_clf = self._prepare(mode="early_label")
+                # UPDATED: Now receives 4 values
+                self.x_clf, self.y_clf, self.file_ids_clf, self.patient_ids_clf = self._prepare(mode="early_label")
 
-    # ... (rest of the code remains the same)
     def _filter_and_sort(self):
         filtered = {}
         for key, value in self.results.items():
@@ -116,7 +118,7 @@ class preictal_dataLoader:
                 return [v]
 
             clips = ensure_list(clips)
-            labels = [str(l).strip().lower() for l in ensure_list(labels)]  # normalize here
+            labels = [str(l).strip().lower() for l in ensure_list(labels)]
             start_times = list(map(float, ensure_list(start_times)))
             stop_times = list(map(float, ensure_list(stop_times)))
 
@@ -137,14 +139,12 @@ class preictal_dataLoader:
         Group bases into (pid, sess) and order by trial -> (global timeline per session).
         Creates a list of events with global_start/global_stop (synthetic), so bckg in t000 can precede ictal in t001.
         """
-        # Map session -> list of (base, trial, clips, labels, starts, stops)
         sess_map = {}
         for base, (clips, labels, starts, stops) in self.filtered_results.items():
             pid, sess, trial = _parse_base_key(base)
             sess_key = (pid, sess)
             sess_map.setdefault(sess_key, []).append((trial, base, clips, labels, starts, stops))
 
-        # Order by trial within each session, and build global time offsets by concatenation
         session_events = {}
         for sess_key, entries in sess_map.items():
             entries.sort(key=lambda x: x[0])  # by trial
@@ -168,9 +168,6 @@ class preictal_dataLoader:
         return session_events
 
     def _adjacent_rule(self, events):
-        """
-        Contiguous 'bckg' blocks immediately before an ictal become 'bckg preictal'.
-        """
         labels = [e["label"] for e in events]
         new_labels = labels.copy()
         n = len(labels)
@@ -180,7 +177,6 @@ class preictal_dataLoader:
                 j = i + 1
                 while j < n and labels[j] == "bckg":
                     j += 1
-                # allow small intermediates (e.g., 'artf') between bckg and ictal
                 k = j
                 gap_ok = True
                 while k < n and labels[k] not in self.target_labels:
@@ -204,14 +200,9 @@ class preictal_dataLoader:
         return new_labels
 
     def _window_rule(self, events):
-        """
-        Mark 'bckg' whose STOP is within preictal_window_sec of NEXT ictal START.
-        Safer: don't mark backgrounds that straddle a previous ictal.
-        """
         labels = [e["label"] for e in events]
         new_labels = labels.copy()
 
-        # Next ictal start/type per index (scan backwards)
         next_ictal_start = [None] * len(events)
         next_ictal_type = [None] * len(events)
         next_start = None
@@ -223,7 +214,6 @@ class preictal_dataLoader:
             next_ictal_start[i] = next_start
             next_ictal_type[i] = next_type
 
-        # Previous ictal stop per index (scan forwards)
         prev_ictal_stop = [None] * len(events)
         prev_stop = None
         for i in range(len(events)):
@@ -233,8 +223,7 @@ class preictal_dataLoader:
 
         for i, e in enumerate(events):
             if labels[i] == "bckg" and next_ictal_start[i] is not None:
-                dist = next_ictal_start[i] - e["gstop"]  # distance from bckg STOP to next ictal START
-                # don't mark if this bckg crosses a previous ictal
+                dist = next_ictal_start[i] - e["gstop"]
                 crosses_prev_ictal = (prev_ictal_stop[i] is not None and e["gstart"] < prev_ictal_stop[i] < e["gstop"])
                 if 0.0 <= dist <= self.preictal_window_sec and not crosses_prev_ictal:
                     new_labels[i] = "bckg preictal"
@@ -247,7 +236,6 @@ class preictal_dataLoader:
         session_events = self._session_groups()
 
         for sess_key, events in session_events.items():
-            # Choose strategy
             if self.preictal_strategy == "adjacent":
                 new_labels = self._adjacent_rule(events)
             elif self.preictal_strategy == "window":
@@ -255,9 +243,7 @@ class preictal_dataLoader:
             else:  # auto
                 new_labels = self._adjacent_rule(events)
                 if "bckg preictal" not in new_labels:
-                    # try current window
                     new_labels = self._window_rule(events)
-                    # optionally expand windows if still nothing
                     if "bckg preictal" not in new_labels and self.auto_expand_windows:
                         original = self.preictal_window_sec
                         for w in self.auto_expand_windows:
@@ -267,15 +253,13 @@ class preictal_dataLoader:
                                 break
                         self.preictal_window_sec = original
 
-            # Build outputs per BASE (keep downstream contract: {base: (...)} )
             by_base = {}
-            session_label_counts = {}  # Track what labels we're finding
+            session_label_counts = {}
 
             for e, lab in zip(events, new_labels):
                 base = e["base"]
                 by_base.setdefault(base, {"clips": [], "dur": [], "labels": [], "gstart": [], "gstop": []})
                 if lab == "bckg preictal":
-                    # Upcoming ictal type for early_label
                     next_type = None
                     for f in events:
                         if f["gstart"] >= e["gstop"] and f["label"] in self.target_labels:
@@ -285,10 +269,8 @@ class preictal_dataLoader:
                         print(f"[DEBUG] Preictal at {base} has no following ictal event! Skipping.")
                         continue
 
-                    # Track labels
                     session_label_counts[next_type] = session_label_counts.get(next_type, 0) + 1
 
-                    # time-to-ictal (seconds) from end of this background segment
                     tti = 0.0
                     for f in events:
                         if f["gstart"] >= e["gstop"] and f["label"] in self.target_labels:
@@ -301,17 +283,15 @@ class preictal_dataLoader:
                     by_base[base]["gstart"].append(e["gstart"])
                     by_base[base]["gstop"].append(e["gstop"])
 
-            # Merge into preictal_dict (may be empty for some bases)
             for base, dat in by_base.items():
                 preictal_dict[base] = {
                     "clips": dat["clips"],
-                    "durations": dat["dur"],     # time-to-ictal seconds
+                    "durations": dat["dur"],
                     "labels": dat["labels"],
                     "gstarts": dat["gstart"],
                     "gstops": dat["gstop"],
                 }
 
-            # Debug summary per session (use 'dur' here; 'durations' is set only after merge)
             dur_lists = [v["dur"] for v in by_base.values() if v["dur"]]
             total_preictal = sum(len(d) for d in dur_lists)
             if total_preictal:
@@ -320,32 +300,45 @@ class preictal_dataLoader:
                     f"[session {sess_key[0]}_s{sess_key[1]}] preictal_total={total_preictal} | "
                     f"tti(s): min={min(flat):.2f} max={max(flat):.2f} mean={np.mean(flat):.2f}"
                 )
-                # Show label distribution for this session
                 print(f"  → Upcoming seizure types in this session: {dict(session_label_counts)}")
             else:
                 print(f"[session {sess_key[0]}_s{sess_key[1]}] no preictal clips (strategy={self.preictal_strategy})")
         return preictal_dict
-
-    def _prepare(self, mode):
+def _prepare(self, mode):
         X_list, Y_list = [], []
+        file_ids_list = []
+        patient_ids_list = []  # NEW: Store patient IDs for patient-wise split
         num_nodes_target = self.num_nodes
         scaler = MinMaxScaler()
 
-        # Use predefined label mapping (DON'T create a new one!)
         if mode == "early_label":
             label_to_numeric = self.label_to_numeric.copy()
-            seen_labels = set()  # Track which labels actually appear
+            seen_labels = set()
             print(f"[DEBUG] Using predefined label mapping: {label_to_numeric}")
         else:
             label_to_numeric = {}
 
-        for key, entry in self.preictal_dict.items():
+        base_keys = list(self.preictal_dict.keys())
+        base_to_id = {key: idx for idx, key in enumerate(base_keys)}
+
+        # NEW: Function to extract patient ID from base key (e.g., "aaaaaaac_s001_t000" -> "aaaaaaac")
+        def extract_patient_id(base_key):
+            parts = base_key.split('_')
+            if len(parts) >= 1:
+                return parts[0]
+            return base_key
+
+        for key in base_keys:
+            entry = self.preictal_dict[key]
             clips = entry["clips"]
             targets = entry["durations"] if mode == "early_reg" else entry["labels"]
             if len(clips) != len(targets):
                 raise ValueError(f"length mismatch for {key}: {len(clips)} clips vs {len(targets)} targets")
 
-            print(f"Processing {key}: {len(clips)} clips, targets={targets[:5] if len(targets) > 5 else targets}")  # Debug
+            print(f"Processing {key}: {len(clips)} clips, targets={targets[:5] if len(targets) > 5 else targets}")
+
+            file_id = base_to_id[key]
+            patient_id = extract_patient_id(key)  # NEW: Extract patient ID
 
             for clip, target in zip(clips, targets):
                 clip = torch.tensor(np.asarray(clip), dtype=torch.float32)
@@ -354,13 +347,11 @@ class preictal_dataLoader:
                     continue
 
                 T, N, F = clip.shape
-                # time to target length
                 if T > self.target_time_points:
                     clip = clip[:self.target_time_points]
                 elif T < self.target_time_points:
                     padding = torch.zeros((self.target_time_points - T, N, F), dtype=torch.float32)
                     clip = torch.cat([clip, padding], dim=0)
-                # channels to target
                 if N > num_nodes_target:
                     clip = clip[:, :num_nodes_target, :]
                     N = num_nodes_target
@@ -369,14 +360,17 @@ class preictal_dataLoader:
                     clip = torch.cat([clip, padding], dim=1)
 
                 X_list.append(clip)
+                file_ids_list.append(file_id)
+                patient_ids_list.append(patient_id)  # NEW: Store patient ID
+
                 if mode == "early_reg":
-                    # time-to-ictal in seconds (float)
                     Y_list.append(float(target))
                 else:
-                    # Use PREDEFINED mapping
                     if target not in label_to_numeric:
                         print(f"⚠️ WARNING: Label '{target}' not in predefined mapping {list(label_to_numeric.keys())}. Skipping this sample.")
-                        X_list.pop()  # Remove the clip we just added
+                        X_list.pop()
+                        file_ids_list.pop()
+                        patient_ids_list.pop()  # NEW: Also pop patient ID
                         continue
                     Y_list.append(label_to_numeric[target])
                     seen_labels.add(target)
@@ -398,22 +392,32 @@ class preictal_dataLoader:
                 "(4) no bckg→ictal in same session or naming doesn’t match '<pid>_s###_t###'."
             )
 
-        X = torch.stack(X_list)  # (B, T, N, F)
+        X = torch.stack(X_list)
+        file_ids = torch.tensor(file_ids_list, dtype=torch.long)
+        patient_ids = np.array(patient_ids_list)  # NEW: Convert patient IDs to numpy array
+
         if mode == "early_reg":
-            y = np.array(Y_list, dtype=float).reshape(-1, 1)
-            if self.reg_target_log:
-                # small epsilon to avoid log(0); log1p keeps small values well-behaved
-                eps = 1e-3
-                y = np.log1p(np.maximum(y, 0.0) + eps)
-            Y = scaler.fit_transform(y).astype(np.float32).flatten()
-            Y = torch.tensor(Y, dtype=torch.float32)
-            self.y_scaler = scaler
+            # #y = np.array(Y_list, dtype=float).reshape(-1, 1)
+            # Y = np.array(Y_list, dtype=float)
+            # # if self.reg_target_log:
+            # #     eps = 1e-3
+            # #     y = np.log1p(np.maximum(y, 0.0) + eps)
+            # # Y = scaler.fit_transform(y).astype(np.float32).flatten()
+
+            # Y = torch.tensor(Y, dtype=torch.float32)
+            # self.y_scaler = scaler
+
+            y_raw = np.array(Y_list, dtype=float)
+            #threshold = 600  # 10 minutes in seconds
+            #y_binary = (y_raw < threshold).astype(int)
+            Y = torch.tensor(y_raw, dtype=torch.long)
+            print(f"Y values distribution:")
+            print(f"  Min: {Y.min():.2f}, Max: {Y.max():.2f}")
+            print(f"  Zeros: {(Y == 0).sum()}/{len(Y)} ({(Y==0).sum()/len(Y)*100:.1f}%)")
+            print(f"  Values < 60s: {(Y < 60).sum()}/{len(Y)} ({(Y<60).sum()/len(Y)*100:.1f}%)")
+            print(f"  Values > 600s: {(Y > 600).sum()}/{len(Y)} ({(Y>600).sum()/len(Y)*100:.1f}%)")
         else:
             Y = torch.tensor(Y_list, dtype=torch.long)
-            # DON'T overwrite self.label_to_numeric - keep the predefined one!
-            # self.label_to_numeric stays as the original predefined mapping
-
-            # Print diagnostic info
             from collections import Counter
             label_counts = Counter(Y_list)
             print(f"\n{'='*60}")
@@ -423,7 +427,6 @@ class preictal_dataLoader:
             print(f"  Labels NOT seen: {set(label_to_numeric.keys()) - seen_labels}")
             print(f"  Label distribution (by index):")
             for idx in sorted(label_counts.keys()):
-                # Find the label name for this index
                 label_name = [k for k, v in label_to_numeric.items() if v == idx][0]
                 print(f"    {idx} ({label_name}): {label_counts[idx]} samples")
             print(f"  Total samples: {len(Y_list)}")
@@ -431,35 +434,48 @@ class preictal_dataLoader:
 
             if len(seen_labels) < 2:
                 print(f"⚠️ WARNING: Only {len(seen_labels)} unique seizure type found: {sorted(seen_labels)}")
-                print(f"⚠️ This means all preictal clips are followed by the same seizure type!")
                 print(f"⚠️ Possible solutions:")
                 print(f"   1. Increase max_files to get more diverse seizure types")
                 print(f"   2. Check your CSV files - do they contain different seizure types?")
                 print(f"   3. Increase preictal_window_sec to capture more varied transitions")
                 print(f"   4. Try preictal_strategy='window' instead of 'adjacent'")
+                print(f"X shape: {X.shape}")
 
-        print(f"Mode {mode}: X shape={tuple(X.shape)}, Y shape={tuple(Y.shape)}, unique numeric values={sorted(set(Y_list))}")
-        return X, Y
 
+        print(f"Mode {mode}: X shape={tuple(X.shape)}, Y shape={tuple(Y.shape)}, "
+            f"file_ids shape={tuple(file_ids.shape)}, unique file IDs={sorted(set(file_ids_list))}, "
+            f"unique patient IDs={len(np.unique(patient_ids))}")  # NEW: Print patient ID stats
+
+        # NEW: Return patient_ids as well
+        return X, Y, file_ids, patient_ids
+
+    # def get_data(self):
+    #     if self.lazy_loading and self.file_paths is not None:
+    #         return self._process_lazy_preictal()
+    #     else:
+    #         # traditional mode: already returns tensors
+    #         if self.early_reg:
+    #             return self.x_reg, self.y_reg, self.file_ids_reg
+    #         else:
+    #             return self.x_clf, self.y_clf, self.file_ids_clf
     def get_data(self):
-        # NEW: Process lazily if in lazy mode
         if self.lazy_loading and self.file_paths is not None:
-            print("[LAZY MODE] Processing files in batches for preictal data...")
             return self._process_lazy_preictal()
-
-        if self.early_reg:
-            return self.x_reg, self.y_reg
         else:
-            return self.x_clf, self.y_clf
-
+            if self.early_reg:
+                X, Y, file_ids, patient_ids = self._prepare(mode="early_reg")
+                return X, Y, file_ids, patient_ids
+            else:
+                X, Y, file_ids, patient_ids = self._prepare(mode="early_label")
+                return X, Y, file_ids, patient_ids
     def _process_lazy_preictal(self, batch_size=10):
-        """
-        NEW: Process preictal data in batches to avoid RAM overflow.
-        """
-        import torch
-        X_list, Y_list = [], []
+        X_list = []
+        Y_list = []
+        file_ids_list = []
+        patient_ids_list = []  # NEW: Store patient IDs
         skipped_batches = 0
         processed_batches = 0
+        global_sequence_id = 0
 
         print(f"[LAZY MODE] Processing {len(self.file_paths)} files in batches of {batch_size}")
 
@@ -467,7 +483,6 @@ class preictal_dataLoader:
             batch_files = self.file_paths[batch_idx:batch_idx + batch_size]
             print(f"[LAZY MODE] Batch {batch_idx//batch_size + 1}/{(len(self.file_paths) + batch_size - 1)//batch_size}")
 
-            # Process batch
             batch_results = {}
             for file_info in batch_files:
                 try:
@@ -475,10 +490,9 @@ class preictal_dataLoader:
                     h5_path = file_info['h5_path']
                     csv_path = file_info['csv_path']
 
-                    # Load and pool data for this file
                     eeg_clips, labels, start_times, stop_times = self.processor.process_h5_and_csv(h5_path, csv_path)
 
-                    if not eeg_clips:  # Skip if no clips
+                    if not eeg_clips:
                         print(f"[LAZY MODE] Skipping {base_name}: No clips found")
                         continue
 
@@ -489,13 +503,11 @@ class preictal_dataLoader:
                     print(f"[LAZY MODE] Error processing {file_info['base_name']}: {e}")
                     continue
 
-            # Skip batch if no valid files
             if not batch_results:
                 print(f"[LAZY MODE] Skipping batch {batch_idx//batch_size + 1}: No valid files")
                 skipped_batches += 1
                 continue
 
-            # Process this batch through the preictal pipeline
             try:
                 temp_loader = preictal_dataLoader(
                     batch_results,
@@ -506,53 +518,33 @@ class preictal_dataLoader:
                     allow_intermediate_labels=self.allow_intermediate,
                     max_gap_between_bckg_and_ictal_sec=self.max_gap_sec,
                     min_preictal_clip_sec=self.min_preictal_sec,
-                    lazy_loading=False  # Use traditional mode for batch processing
+                    lazy_loading=False,
+                    processor=self.processor,
+                    pooler=self.pooler
                 )
 
-                batch_X, batch_Y = temp_loader.get_data()
-                X_list.append(batch_X)
-                Y_list.append(batch_Y)
-                processed_batches += 1
+                batch_X, batch_Y, batch_file_ids, batch_patient_ids = temp_loader.get_data()  # Updated
 
-                print(f"[LAZY MODE] Batch processed: {batch_X.shape[0]} samples")
+                for i in range(batch_X.shape[0]):
+                    X_list.append(batch_X[i])
+                    Y_list.append(batch_Y[i])
+                    file_ids_list.append(global_sequence_id)
+                    patient_ids_list.append(batch_patient_ids[i])  # NEW: Store patient ID
+                    global_sequence_id += 1
+
+                processed_batches += 1
+                print(f"[LAZY MODE] Batch processed: {batch_X.shape[0]} sequences")
 
             except ValueError as e:
-                # Handle batches with no preictal samples
                 if "No preictal samples built" in str(e):
                     print(f"[LAZY MODE] Skipping batch {batch_idx//batch_size + 1}: No preictal samples (this is normal for some batches)")
                     skipped_batches += 1
                 else:
                     raise
 
-            # Clear batch from memory
-            if 'batch_results' in locals():
-                del batch_results
-            if 'temp_loader' in locals():
-                del temp_loader
-            if 'batch_X' in locals():
-                del batch_X, batch_Y
             import gc
             gc.collect()
 
-        # Check if we got any data
         if not X_list:
-            raise ValueError(
-                f"No preictal samples found in ANY batch!\n"
-                f"- Total batches: {(len(self.file_paths) + batch_size - 1)//batch_size}\n"
-                f"- Skipped batches: {skipped_batches}\n"
-                f"- Processed batches: {processed_batches}\n\n"
-                f"Possible solutions:\n"
-                f"1. Increase max_files to get more diverse data\n"
-                f"2. Check that CSV files contain both 'bckg' and seizure labels\n"
-                f"3. Reduce min_channels_per_event in EEGProcessorPreictal\n"
-                f"4. Increase preictal_window_sec (currently using default)\n"
-                f"5. Check file naming matches pattern '<patient>_s<session>_t<trial>'"
-            )
-
-        # Concatenate all batches
-        X_final = torch.cat(X_list, dim=0)
-        Y_final = torch.cat(Y_list, dim=0)
-
-        print(f"[LAZY MODE] Final preictal data: X={X_final.shape}, Y={Y_final.shape}")
-        print(f"[LAZY MODE] Batches: {processed_batches} successful, {skipped_batches} skipped")
-        return X_final, Y_final
+            raise ValueError("No sequences found in any batch.")
+        return X_list, Y_list, file_ids_list, patient_ids_list 
