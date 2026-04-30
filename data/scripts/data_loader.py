@@ -5,6 +5,87 @@ import h5py
 import numpy as np
 import pandas as pd
 from scipy.fftpack import fft
+import os
+import numpy as np
+from collections import defaultdict
+
+def extract_patient_id_from_path(file_path: str) -> str:
+    """
+    Extract patient ID from file path.
+    Pattern: {patient_id}_s{session}_t{trial}.h5
+    Example: aaaaaaac_s001_t000.h5 -> aaaaaaac
+    """
+    base_name = os.path.basename(file_path)
+    # Remove extension
+    base_name = base_name.replace('.h5', '').replace('.edf', '')
+    # Extract patient ID (everything before first underscore)
+    patient_id = base_name.split('_')[0]
+    return patient_id
+
+
+def patient_wise_split_file_paths(file_paths, test_size=0.2, random_state=42):
+    """
+    Split file paths by patient, not by file.
+    
+    Args:
+        file_paths: List of file path dictionaries (with 'h5_path' key)
+        test_size: Proportion of patients to use for validation
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        train_files, val_files: Lists of file dicts for training and validation
+        train_patients, val_patients: Lists of patient IDs for each split
+    """
+    # Extract patient IDs from file paths
+    patient_ids = []
+    for file_dict in file_paths:
+        h5_path = file_dict.get('h5_path', '')
+        patient_id = extract_patient_id_from_path(h5_path)
+        patient_ids.append(patient_id)
+    
+    # Get unique patients
+    unique_patients = np.unique(patient_ids)
+    n_patients = len(unique_patients)
+    n_val_patients = max(1, int(n_patients * test_size))
+    
+    # Split patients
+    np.random.seed(random_state)
+    val_patients = set(np.random.choice(unique_patients, n_val_patients, replace=False))
+    train_patients = [p for p in unique_patients if p not in val_patients]
+    
+    # Assign files based on patient
+    train_files = []
+    val_files = []
+    
+    for file_dict, p in zip(file_paths, patient_ids):
+        if p in train_patients:
+            train_files.append(file_dict)
+        else:
+            val_files.append(file_dict)
+    
+    return train_files, val_files, train_patients, list(val_patients)
+
+
+def validate_patient_split_no_leakage(train_files, val_files):
+    """Ensure no patient appears in both train and validation sets."""
+    train_patients = set()
+    val_patients = set()
+    
+    for f in train_files:
+        patient_id = extract_patient_id_from_path(f.get('h5_path', ''))
+        train_patients.add(patient_id)
+    
+    for f in val_files:
+        patient_id = extract_patient_id_from_path(f.get('h5_path', ''))
+        val_patients.add(patient_id)
+    
+    overlap = train_patients.intersection(val_patients)
+    
+    if overlap:
+        raise ValueError(f"Data leakage detected! Patients {overlap} appear in both sets.")
+    
+    print(f"✓ No data leakage: {len(train_patients)} train patients, {len(val_patients)} val patients, overlap=0")
+    return True
 
 class EEGProcessor:
     def __init__(self, root_directory, resampled_freq=200, time_step_size=1, apply_fft=True, max_files=8000):
@@ -14,19 +95,17 @@ class EEGProcessor:
         self.time_step_size = time_step_size
         self.apply_fft = apply_fft
         self.max_files = max_files  # Default maximum number of files to process
-#         self.included_channels = [
+        self.included_channels = [
 #     "Fp1-F7", "F7-T3", "T3-T5", "T5-O1", "Fp2-F8", "F8-T4", "T4-T6", "T6-O2",
 #     "Fp1-F3", "F3-C3", "C3-P3", "P3-O1", "Fp2-F4", "F4-C4", "C4-P4", "P4-O2",
 #     "FZ-CZ", "CZ-PZ", "P7-T5" #"P8-T6"
 # ]
         
         
-        [
+        
 
-            'A1-T3', 'C3-CZ', 'C3-P3', 'C4-P4', 'C4-T4', 'CZ-C4',
-            'F3-C3', 'F4-C4', 'F7-T3', 'F8-T4', 'FP1-F3', 'FP1-F7',
-            'FP2-F4', 'FP2-F8', 'P3-O1', 'P4-O2', 'T3-C3', 'T3-T5',
-            'T4-A2', 'T4-T6', 'T5-O1', 'T6-O2'
+         'FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2',
+    'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'FZ', 'CZ', 'PZ'
         ]
     
     def convert_edf_to_h5(self):
@@ -155,26 +234,21 @@ class EEGProcessor:
             print(f"Error processing {h5_path}: {e}. Skipping this file.")
             return [], [], None, pd.DataFrame(), pd.DataFrame()  # Return empty results to skip gracefully
     
-    def process_directory(self, max_files=None):
+    def process_directory(self, max_files=None, return_patient_ids=False):
         """
-        NEW: Returns file paths instead of loading all data into memory.
-        This prevents RAM crashes with large datasets.
+        Returns file paths instead of loading all data into memory.
+        
+        Args:
+            max_files: Maximum number of files to process
+            return_patient_ids: If True, also return patient IDs for each file
+        
+        Returns:
+            file_paths: List of file dicts
+            patient_ids: (Optional) List of patient IDs
         """
-        file_paths = []  # Store paths instead of data
+        file_paths = []
+        patient_ids_list = []  # NEW
         count = 0
-
-        # Skip H5 conversion if all H5 files already exist (optional optimization)
-        all_have_h5 = all(os.path.exists(os.path.join(root, f.replace(".edf", ".h5")))
-                          for root, _, files in os.walk(self.root_directory)
-                          for f in files if f.endswith(".edf"))
-        if not all_have_h5:
-            print("Ensuring all EDF files are converted to H5...")
-            converted, failed = self.convert_edf_to_h5()
-        else:
-            print("All EDF files already have corresponding H5 files. Skipping conversion.")
-
-        # Use the provided max_files or fall back to the instance's max_files
-        effective_max_files = max_files if max_files is not None else self.max_files
 
         for root, _, files in os.walk(self.root_directory):
             for file in files:
@@ -183,27 +257,23 @@ class EEGProcessor:
                     h5_path = os.path.join(root, base_name + ".h5")
                     csv_path = os.path.join(root, base_name + ".csv")
 
-                    if not os.path.exists(h5_path) and os.path.join(root, base_name + ".edf") not in failed:
-                        print(f"Warning: H5 file missing for {base_name}, but not previously failed. Attempting conversion...")
-                        try:
-                            self._process_edf_file(os.path.join(root, base_name + ".edf"), h5_path)
-                        except Exception as e:
-                            print(f"Conversion failed for {base_name}: {e}")
-                            continue
-
                     if os.path.exists(h5_path) and os.path.exists(csv_path):
-                        # Store paths only, don't load data yet
                         file_paths.append({
                             'base_name': base_name,
                             'h5_path': h5_path,
                             'csv_path': csv_path
                         })
+                        patient_ids_list.append(extract_patient_id_from_path(h5_path))  # NEW
                         count += 1
-                        if count >= effective_max_files:
-                            print(f"Reached limit of {effective_max_files} files. Stopping.")
+                        if count >= max_files:
+                            print(f"Reached limit of {max_files} files. Stopping.")
+                            if return_patient_ids:
+                                return file_paths, patient_ids_list
                             return file_paths
                     else:
                         print(f"Skipping {base_name}: Missing H5 or CSV file.")
 
         print(f"Found {count} files for processing.")
+        if return_patient_ids:
+            return file_paths, patient_ids_list
         return file_paths
