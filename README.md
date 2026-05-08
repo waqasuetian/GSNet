@@ -24,6 +24,7 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 <p align="center">
 <b>Figure 1.</b> GSNet Flow.
 </p>
+
 ## Hybrid Graph Construction
 
 <p align="center">
