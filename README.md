@@ -36,7 +36,7 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 <p align="center">
 <b>Figure 1.</b> Overall GSNet framework for multi-stage seizure monitoring.
 </p>
-## Installation
+
 
 ### Prerequisites
 - Python 3.8 or higher.
