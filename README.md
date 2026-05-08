@@ -17,7 +17,13 @@ GSNet is a novel, hybrid graph-based deep learning (DL) framework designed for r
 
 This framework advances computational neuroscience by enabling holistic EEG analysis, supporting precise healthcare interventions for epilepsy patients affecting over 70 million worldwide.
 # 🏗️ GSNet Architecture
+<p align="center">
+  <img src="Graphical Abstract.jpeg" width="900">
+</p>
 
+<p align="center">
+<b>Figure 1.</b> GSNet Flow.
+</p>
 ## Hybrid Graph Construction
 
 <p align="center">
@@ -27,6 +33,7 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 <p align="center">
 <b>Figure 1.</b> Hybrid Graph Construction in GSNet framework.
 </p>
+
 ## GSNet Framework
 
 <p align="center">
