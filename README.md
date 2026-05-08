@@ -21,7 +21,7 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 ## Overall Framework
 
 <p align="center">
-  <img src="figures/gsnet_architecture.png" width="900">
+  <img src="main (2).png" width="900">
 </p>
 
 <p align="center">
