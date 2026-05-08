@@ -1,17 +1,17 @@
 # GSNet: A Unified Graph-Based Deep Learning Framework for Multi-Stage Seizure Monitoring
 
 ## Overview
-GSNet is a novel, graph-based deep learning (DL) framework designed for real-time epileptic seizure monitoring using Electroencephalography (EEG) signals. Developed as part of the research paper *"A Unified Graph-Based Deep Learning Framework for Multi-Stage Seizure Monitoring"* by Waqas Ali and Muhammad Shahbaz (Department of Computer Engineering, University of Engineering and Technology, Lahore, Pakistan), GSNet addresses key challenges in epilepsy care by integrating seizure detection, classification, and early forecasting of onset and type within a single, efficient architecture.
+GSNet is a novel, hybrid graph-based deep learning (DL) framework designed for real-time epileptic seizure monitoring using Electroencephalography (EEG) signals. Developed as part of the research paper *"A Unified Graph-Based Deep Learning Framework for Multi-Stage Seizure Monitoring"* by Waqas Ali and Muhammad Shahbaz (Department of Computer Engineering, University of Engineering and Technology, Lahore, Pakistan), GSNet addresses key challenges in epilepsy care by integrating seizure detection, classification, and early forecasting of onset and type within a single, efficient architecture.
 
 - **Core Innovations:**
-  - Transforms non-Euclidean EEG signals into optimized graph structures to capture spatiotemporal dependencies.
+  - Transforms non-Euclidean EEG signals into hybrid graph structures to capture spatiotemporal dependencies.
   - Employs a shared Graph Convolutional Network (GCN) backbone with task-specific heads for multi-stage processing.
   - Provides interpretable band×node soft attribution maps to highlight critical EEG channels and frequency contributions.
   
 - **Performance Highlights (on Temple University Seizure Corpus - TUSZ):**
-  - Seizure Detection: 93% Area Under the Receiver Operating Characteristic Curve (AUROC).
-  - Seizure Classification: 0.74 weighted F1-score.
-  - Onset Forecasting: 0.80 R²-score.
+  - Seizure Detection: 94% Area Under the Receiver Operating Characteristic Curve (AUROC).
+  - Seizure Classification: 0.81 weighted F1-score.
+  - Onset Forecasting: 0.785 R²-score.
   - Seizure Type Forecasting: 0.83 weighted F1-score.
 
 This framework advances computational neuroscience by enabling holistic EEG analysis, supporting precise healthcare interventions for epilepsy patients affecting over 70 million worldwide.
@@ -39,8 +39,8 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 ## Usage
 
 ### Data Preparation
-- Preprocess EEG data into 2-second clips (512 samples at 256 Hz sampling rate) with band-pass filtering (0.5-50 Hz).
-- Run the synthesis script to generate graph structures and task-specific labels (binary for detection, multiclass for classification, temporal for forecasting):
+- Preprocess EEG data into 12-second clips (512 samples at 256 Hz sampling rate) with band-pass filtering (0.5-50 Hz).
+- Run the synthesis script to generate hybrid graph structures and task-specific labels (binary for detection, multiclass for classification, temporal for forecasting):
   ```
   python src/data/preprocess.py --input_dir data/tusz --output_dir data/processed --clip_length 2 --sample_rate 256
   ```
@@ -104,7 +104,7 @@ Contributions are welcome! For bug fixes, new features (e.g., support for CHB-MI
 Please reference the paper's methodology for any modifications.
 
 ## License
-MIT License - See [LICENSE](LICENSE) for details. Note: TUSZ dataset requires separate attribution.
+
 
 ## Citation
 If you use GSNet in your work, please cite:
@@ -112,7 +112,7 @@ If you use GSNet in your work, please cite:
 @article{ali2025gsnet,
   title={A Unified Graph-Based Deep Learning Framework for Multi-Stage Seizure Monitoring},
   author={Ali, Waqas and Shahbaz, Muhammad},
-  journal={Neuroinformatics (submitted)},
+  journal={Medical & Biological & Engineering & Computing (Under Review)},
   year={2025},
   doi={...}  % Update upon acceptance
 }
