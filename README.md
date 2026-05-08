@@ -3,6 +3,7 @@
 ## Overview
 GSNet is a novel, hybrid graph-based deep learning (DL) framework designed for real-time epileptic seizure monitoring using Electroencephalography (EEG) signals. Developed as part of the research paper *"A Unified Graph-Based Deep Learning Framework for Multi-Stage Seizure Monitoring"* by Waqas Ali and Muhammad Shahbaz (Department of Computer Engineering, University of Engineering and Technology, Lahore, Pakistan), GSNet addresses key challenges in epilepsy care by integrating seizure detection, classification, and early forecasting of onset and type within a single, efficient architecture.
 
+
 - **Core Innovations:**
   - Transforms non-Euclidean EEG signals into hybrid graph structures to capture spatiotemporal dependencies.
   - Employs a shared Graph Convolutional Network (GCN) backbone with task-specific heads for multi-stage processing.
@@ -15,6 +16,17 @@ GSNet is a novel, hybrid graph-based deep learning (DL) framework designed for r
   - Seizure Type Forecasting: 0.83 weighted F1-score.
 
 This framework advances computational neuroscience by enabling holistic EEG analysis, supporting precise healthcare interventions for epilepsy patients affecting over 70 million worldwide.
+# 🏗️ GSNet Architecture
+
+## Overall Framework
+
+<p align="center">
+  <img src="figures/gsnet_architecture.png" width="900">
+</p>
+
+<p align="center">
+<b>Figure 1.</b> Overall GSNet framework for multi-stage seizure monitoring.
+</p>
 
 ## Installation
 
