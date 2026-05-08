@@ -25,7 +25,7 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 </p>
 
 <p align="center">
-<b>Figure 1.</b> Overall GSNet framework for multi-stage seizure monitoring.
+<b>Figure 1.</b> Hybrid Graph Construction in GSNet framework.
 </p>
 ## GSNet Framework
 
