@@ -140,8 +140,8 @@ If you use GSNet in your work, please cite:
 @article{ali2025gsnet,
   title={A Unified Graph-Based Deep Learning Framework for Multi-Stage Seizure Monitoring},
   author={Ali, Waqas and Shahbaz, Muhammad},
-  journal={Medical & Biological & Engineering & Computing (Under Review)},
-  year={2025},
+  journal={(Under Review)},
+  year={2026},
   doi={...}  % Update upon acceptance
 }
 ```
