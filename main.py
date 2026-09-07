@@ -48,8 +48,8 @@ def run_pipeline(
     classification: bool = False,
     early_reg: bool = False,
     early_label: bool = False,
-    directory: str = r'F:\tuh_data\train',
-    num_features: int = 1200,
+    directory: str = r'E:\tuh_data\train',
+    num_features: int = 100,
     num_hiddens: int = 64,
     dropout: float = 0.2,
     num_heads: int = 8,
@@ -76,6 +76,13 @@ def run_pipeline(
     patient_wise_split: bool = True,      # NEW
     test_patient_ratio: float = 0.2,      # NEW
     random_seed: int = 42,                # NEW
+        # ---- Path B pass-throughs ----
+    freeze_backbone: bool = False,
+    backbone_ckpt: str = None,
+    save_backbone_to: str = None,
+    freeze_gru: bool = False,
+    gru_ckpt: str = None,
+    save_gru_to: str = None,
 ):
     
     """
@@ -253,14 +260,20 @@ def run_pipeline(
     # -------------------------------
     return trainer.train(
         X_arr, Y_arr,
-        #file_ids=file_ids,
         detection=detection,
         classification=classification,
         early_reg=early_reg,
         early_clf=early_label,
-        file_ids=patient_ids,  
-        X_val=X_val,          # NEW
-        Y_val=Y_val
+        #file_ids=patient_ids,
+        X_val=X_val,
+        Y_val=Y_val,
+        # ---- Path B ----
+        freeze_backbone=freeze_backbone,
+        backbone_ckpt=backbone_ckpt,
+        save_backbone_to=save_backbone_to,
+        freeze_gru=freeze_gru,
+        gru_ckpt=gru_ckpt,
+        save_gru_to=save_gru_to,
     )
 if __name__ == "__main__":
     # ===== CONFIGURE YOUR DATA PATH HERE =====
@@ -271,15 +284,15 @@ if __name__ == "__main__":
     real_class_names = ['gnsz', 'fnsz', 'tcsz', 'absz', 'mysz', 'cpsz', 'tnsz']
 
    # Train Detection Head (uncomment to run)
-    # run_pipeline(
-    #     directory=r"F:\tuh_data\train",
-    #     num_classes=num_classes,
-    #     detection=True,
-    #     max_files=200,
-    #     graph_method='hybrid',
-    #     graph_params={'alpha': 0.5}
+    run_pipeline(
+        directory=r"E:\tuh_data\train",
+        num_classes=num_classes,
+        detection=True,
+        max_files=200,
+        graph_method='hybrid',
+        graph_params={'alpha': 0.5}
 
-    # )
+    )
 
 #     # # Train Classification Head (uncomment to run)
     # run_pipeline(
@@ -303,14 +316,14 @@ if __name__ == "__main__":
         
 #     )
 
-# #    # Train Early Classification Head
-    run_pipeline(
-        directory=r"F:\tuh_data\train",
-        num_classes=num_classes,
-        early_label=True,
-        max_files=1000,
-        graph_method='hybrid',
-        graph_params={'alpha': 0.5},
+# # #    # Train Early Classification Head
+#     run_pipeline(
+#         directory=r"E:\tuh_data\train",
+#         num_classes=num_classes,
+#         early_label=True,
+#         max_files=1000,
+#         graph_method='hybrid',
+#         graph_params={'alpha': 0.5},
         
 
- )
+#  )
