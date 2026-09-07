@@ -163,3 +163,4 @@ class MultiTaskGCN(nn.Module):
         if self.use_uncertainty:
             outputs['log_vars'] = self.log_vars
         return outputs
+    
