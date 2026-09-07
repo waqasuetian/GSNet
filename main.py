@@ -50,7 +50,7 @@ def run_pipeline(
     early_label: bool = False,
     directory: str = r'F:\tuh_data\train',
     num_features: int = 1200,
-    num_hiddens: int = 100,
+    num_hiddens: int = 64,
     dropout: float = 0.2,
     num_heads: int = 8,
     learning_rate: float = 0.005,
