@@ -149,6 +149,7 @@ If you use GSNet in your work, please cite:
 ## Authors and Contact
 - **Waqas Ali** (Corresponding): waqas.ali2@uet.edu.pk
 - **Muhammad Shahbaz**: m.shahbaz@uet.edu.pk
+- **Mohammad j.Alghamdi** m.jalghamdi@umm.edu.sa
 
 ## Acknowledgements
 - Supported by the Department of Computer Engineering, UET Lahore.
