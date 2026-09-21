@@ -1,30 +1,4 @@
 
-"""
-Joint multi-head baseline for GSNet (Reviewer 2, comments 11 & 13).
-
-This is the *naive unification* that reviewers expect as a comparison point:
-ONE shared GCN backbone (NOT frozen) with all four heads trained
-SIMULTANEOUSLY. On every optimizer step we draw one batch per task, compute
-each task's loss, sum them, and backpropagate once -- so the backbone receives
-gradients from all four tasks jointly. Contrast this with GSNet's modular
-design, where the backbone is trained once and then frozen while heads are
-trained on the frozen representation.
-
-Why round-robin (and not one big multi-task batch): the four tasks have
-heterogeneous input structure (detection/classification operate on single
-windows; forecasting on length-L window sequences) and disjoint label
-availability (a background clip has no seizure type). A single jointly-labeled
-batch therefore does not exist; round-robin joint optimization is the standard
-way to train one shared trunk from several task-specific datasets.
-
->>> This produces the "Joint multi-head" row of Table tab:jointbaseline.
->>> I cannot run it for you; wire in your per-task loaders (see PREP HOOKS)
-    and run it. Do not paste numbers you have not produced.
-
-Optional: set TEMPORAL="transformer" to make the temporal encoder a small
-Transformer instead of the GRU, i.e. a literal multi-task GNN-Transformer,
-which is the exact phrasing of Reviewer 2 comment 11.
-"""
 
 import torch
 import torch.nn as nn
