@@ -1,20 +1,4 @@
-"""
-Path B driver — trains ONE shared GCN backbone + ONE shared GRU + four heads.
 
-Run order (each call reuses our existing run_pipeline / Trainer):
-
-  Phase 1  detection      -> trains backbone + detection head, SAVES backbone
-  Phase 2a classification -> freezes backbone, trains classification head
-  Phase 2b early_reg      -> freezes backbone, trains GRU + time head, SAVES GRU
-  Phase 2c early_label    -> freezes backbone + GRU, trains type head
-
-Prerequisite edits :
-  * models/model.py            -> replaced with the Path B version
-  * models/trainer.py          -> 4 small insertions (new kwargs threaded to build/opt/save)
-  * main.py run_pipeline(...)   -> 3 new kwargs threaded to trainer.train(...)
-
-Adjust DATA_* paths, max_files, epochs, and alpha to your setup.
-"""
 
 import os
 from main import run_pipeline
