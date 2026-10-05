@@ -1,10 +1,12 @@
 
+
 import os
 os.environ["LOKY_MAX_CPU_COUNT"] = "8"
 import warnings
 from typing import List, Tuple, Union, Dict, Any
 import numpy as np
 import torch
+import pandas as pd
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.data import Data, Batch
@@ -27,9 +29,10 @@ from data.scripts.viz import Viz
 from imblearn.over_sampling import SMOTE, RandomOverSampler
 from sklearn.metrics import f1_score
 import scipy.stats as stats
-from sklearn.model_selection import StratifiedKFold, GroupKFold
+from sklearn.model_selection import StratifiedKFold, GroupKFold, StratifiedGroupKFold
 from scipy import stats
 from sklearn.utils import resample
+from models.confusion import save_task_confusion   # if trainer.py is imported as part of the models package
 
 __all__ = ["Trainer", "make_overview_radars", "run_stratified_kfold", "utilis"]
 
@@ -823,6 +826,9 @@ class Trainer:
         n_nodes = X_seq.shape[2]
         n_features = X_seq.shape[3]
 
+        # models/trainer.py, right after line ~816 where n_features is computed:
+        print(">>> RC per-window node feature dim (B) =", n_features)
+
         if n_nodes != self.num_nodes:
             raise ValueError(f"Node count mismatch: data has {n_nodes}, model expects {self.num_nodes}")
 
@@ -979,1424 +985,1040 @@ class Trainer:
     # Main train method
     # ----------------------------------------------------------------------
 
-    def train(
-            self,
-            X,
-            Y,
-            file_ids=None,
-            X_val=None,           # NEW
-            Y_val=None,           # NEW
-            detection: bool = False,
-            classification: bool = False,
-            early_reg: bool = False,
-            early_clf: bool = False,
-            explain_after: bool = False,
-            explain_path: str | None = None
-        ):
+    # def train(
+    #         self,
+    #         X,
+    #         Y,
+    #         file_ids=None,
+    #         X_val=None,           # NEW
+    #         Y_val=None,           # NEW
+    #         detection: bool = False,
+    #         classification: bool = False,
+    #         early_reg: bool = False,
+    #         early_clf: bool = False,
+    #         explain_after: bool = False,
+    #         explain_path: str | None = None
+    #     ):
     
-        os.makedirs("models/checkpoints", exist_ok=True)
-        val_loader = None
-        epoch_idx = []
-        train_trace = []
-        val_trace = []
-        all_preds = []
-        all_labels = []
-        X = np.array(X)
-        Y = np.array(Y)
+    def train(
+        self,
+        X,
+        Y,
+        file_ids=None,
+        X_val=None,              # kept only for backward compatibility; ignored in K-fold mode
+        Y_val=None,              # kept only for backward compatibility; ignored in K-fold mode
+        detection: bool = False,
+        classification: bool = False,
+        early_reg: bool = False,
+        early_clf: bool = False,
+        explain_after: bool = False,
+        explain_path: str | None = None,
+        freeze_backbone: bool = False,
+        backbone_ckpt: str | None = None,
+        save_backbone_to: str | None = None,
+        freeze_gru: bool = False,
+        gru_ckpt: str | None = None,
+        save_gru_to: str | None = None,
+        use_kfold: bool = True,
+        n_splits: int = 5,
+        random_seed: int = 42,
+        kfold_out_dir: str = "kfold_results",
+    ):
+        """
+        Train with leakage-safe PATIENT-WISE K-fold cross-validation.
 
-        task = "detection" if detection else "classification" if classification else "early_reg" if early_reg else "early_clf"
-        from sklearn.metrics import accuracy_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
-        from scipy.stats import wilcoxon
-# # ====================================================================
-# # FORECASTING BRANCH (early_reg / early_clf)
-# # ====================================================================
+        Categorical tasks use StratifiedGroupKFold; time-to-seizure
+        regression uses GroupKFold.  Every patient is wholly contained in
+        either the training or validation partition for a given fold.
+
+        Scaling, oversampling, class weighting and model fitting are performed
+        independently inside each fold.  A fresh model is created for every
+        fold.  Fold-level sample/class summaries and performance metrics are
+        saved as CSV files.
+        """
+        import json
+        from pathlib import Path
+        from sklearn.metrics import (
+            accuracy_score, balanced_accuracy_score, precision_score,
+            recall_score, f1_score, roc_auc_score, average_precision_score,
+            confusion_matrix, mean_squared_error, mean_absolute_error, r2_score,
+        )
+
+        # ------------------------------------------------------------
+        # Basic validation / task selection
+        # ------------------------------------------------------------
+        flags = [detection, classification, early_reg, early_clf]
+        if sum(bool(v) for v in flags) != 1:
+            raise ValueError(
+                "Exactly one task flag must be True: detection, classification, "
+                "early_reg or early_clf."
+            )
+
+        task = (
+            "detection" if detection else
+            "classification" if classification else
+            "early_reg" if early_reg else
+            "early_clf"
+        )
+        model_task = "forecast_label" if early_clf else task
+
+        X = np.asarray(X)
+        Y = np.asarray(Y)
+        if file_ids is None:
+            raise ValueError(
+                "Patient IDs (file_ids) are required for patient-wise K-fold CV. "
+                "Pass the patient-id array returned by the data loader."
+            )
+        if isinstance(file_ids, torch.Tensor):
+            file_ids = file_ids.detach().cpu().numpy()
+        file_ids = np.asarray(file_ids, dtype=object).reshape(-1)
+        Y = Y.reshape(-1)
+
+        if len(X) != len(Y) or len(Y) != len(file_ids):
+            raise ValueError(
+                f"Length mismatch: X={len(X)}, Y={len(Y)}, patient_ids={len(file_ids)}"
+            )
+
+        unique_patients = np.unique(file_ids)
+        if len(unique_patients) < 2:
+            raise ValueError(
+                "Patient-wise K-fold requires at least two unique patients."
+            )
+
+        requested_splits = int(n_splits)
+        if requested_splits < 2:
+            raise ValueError("n_splits must be >= 2")
+        actual_splits = min(requested_splits, len(unique_patients))
+        if actual_splits != requested_splits:
+            print(
+                f"[K-FOLD] Requested {requested_splits} folds but only "
+                f"{len(unique_patients)} patients are available. "
+                f"Using {actual_splits} folds for this run."
+            )
+
+        os.makedirs(kfold_out_dir, exist_ok=True)
+        task_out_dir = os.path.join(kfold_out_dir, task)
+        os.makedirs(task_out_dir, exist_ok=True)
+        os.makedirs("models/checkpoints", exist_ok=True)
+
+        # ------------------------------------------------------------
+        # Human-readable class names
+        # ------------------------------------------------------------
+        if detection:
+            class_name_map = {0: "bckg/non-seizure", 1: "seizure"}
+        else:
+            class_name_map = {
+                0: "gnsz", 1: "fnsz", 2: "tcsz", 3: "absz",
+                4: "mysz", 5: "cpsz", 6: "tnsz",
+            }
+
+        def _print_full_dataset_summary():
+            print("\n" + "=" * 86)
+            print(f"FULL DATASET SUMMARY — {task.upper()}")
+            print("=" * 86)
+            print(f"Samples:          {len(Y)}")
+            print(f"Unique patients:  {len(unique_patients)}")
+            counts_per_patient = np.array(
+                [np.sum(file_ids == p) for p in unique_patients], dtype=int
+            )
+            print(
+                "Samples/patient:  "
+                f"min={counts_per_patient.min()}, max={counts_per_patient.max()}, "
+                f"mean={counts_per_patient.mean():.2f}"
+            )
+            if not early_reg:
+                print("\nSamples per class:")
+                classes, counts = np.unique(Y.astype(int), return_counts=True)
+                for cls, cnt in zip(classes, counts):
+                    pct = 100.0 * cnt / len(Y)
+                    print(
+                        f"  {int(cls):>2} {class_name_map.get(int(cls), str(cls)):<20} "
+                        f"{int(cnt):>7} ({pct:6.2f}%)"
+                    )
+            else:
+                yy = Y.astype(float)
+                print(
+                    "Regression target: "
+                    f"min={yy.min():.3f}, max={yy.max():.3f}, "
+                    f"mean={yy.mean():.3f}, median={np.median(yy):.3f}, "
+                    f"std={yy.std():.3f}"
+                )
+            print("=" * 86)
+
+        _print_full_dataset_summary()
         if early_reg or early_clf:
             if X.ndim != 4:
-                raise ValueError(f"Expected X for forecasting to have 4 dims, got {X.shape}")
+                raise ValueError(
+                    f"Forecasting expects X=(samples, sequence, nodes, features), got {X.shape}"
+                )
             B, L, N, raw_dim = X.shape
             if N != self.num_nodes:
                 raise ValueError(f"Expected {self.num_nodes} nodes, got {N}")
 
-            # Build features from raw signals if needed
-            if raw_dim == 200:
-                print(f"Applying FeatureBuilder to raw signals...")
+            if raw_dim != 121:
+                print(f"[features] Building forecasting features from raw_dim={raw_dim} ...")
                 fb = FeatureBuilder(
-                    fs=200, rfft_bins=100,
+                    fs=200,
+                    rfft_bins=100,
                     with_time=False,
                     with_shapes=True,
                     with_complexity=True,
-                    with_connectivity=True
+                    with_connectivity=False,   # fold-specific graph weights below
                 )
-
-                # Process each (sample, time) window individually
-                # X shape: (B, L, N, raw_dim) -> we iterate over B and L
-                all_features = []
-                all_conn = []
+                feature_windows = []
                 for b in range(B):
                     for l in range(L):
-                        # Extract one window: shape (N, raw_dim)
-                        window = X[b, l]  # (N, raw_dim)
-                        # FeatureBuilder expects (batch, nodes, time) -> add batch dim
-                        window_batch = window[np.newaxis, :, :]  # (1, N, raw_dim)
-                        feat, conn = fb.build(window_batch, mode=task)
-                        # feat shape: (1, 1, N, feat_dim) or (1, N, feat_dim)
+                        window_batch = X[b, l][np.newaxis, :, :]
+                        built = fb.build(window_batch, mode=task)
+                        feat = built[0] if isinstance(built, tuple) else built
                         if feat.ndim == 4:
-                            feat = feat.squeeze(0).squeeze(0)  # (N, feat_dim)
+                            feat = feat.squeeze(0).squeeze(0)
                         elif feat.ndim == 3:
-                            feat = feat.squeeze(0)  # (N, feat_dim)
-                        all_features.append(feat)
-                        all_conn.append(conn.squeeze(0) if conn is not None else None)
-
-                # Stack into (B*L, N, feat_dim)
-                X_feat = np.stack(all_features, axis=0)  # (B*L, N, feat_dim)
-                # Average connectivity over windows
-                if all_conn[0] is not None:
-                    conn_stack = np.stack(all_conn, axis=0)  # (B*L, N, N)
-                    conn = conn_stack.mean(axis=0)           # (N, N)
-                else:
-                    conn = None
-
+                            feat = feat.squeeze(0)
+                        feature_windows.append(feat)
+                X_feat = np.stack(feature_windows, axis=0)
                 in_dim_actual = X_feat.shape[-1]
-                # Reshape to (B, L, N, feat_dim)
                 X_graph = X_feat.reshape(B, L, N, in_dim_actual)
-                print(f"Final X_graph shape: {X_graph.shape}, feature dim: {in_dim_actual}")
             else:
-                print(f"Using pre-computed features (shape: {X.shape})")
-                X_graph = X
+                X_graph = X.astype(np.float32, copy=False)
                 in_dim_actual = raw_dim
-                conn = None
-
-            # ========== CREATE GRAPH EDGES FROM CONNECTIVITY ==========
-            if conn is not None:
-                C = conn
-                # Ensure symmetric, non-negative, zero diagonal
-                C = np.abs(C)
-                C = (C + C.T) / 2.0
-                np.fill_diagonal(C, 0.0)
-                r, c = np.triu_indices(N, k=1)
-                edge_weight = torch.tensor(C[r, c], dtype=torch.float32)
-                edge_index = torch.tensor(np.vstack([r, c]), dtype=torch.long)
-                self.edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1).to(self.device)
-                self.edge_weight = torch.cat([edge_weight, edge_weight], dim=0).to(self.device)
-                print(f"Graph edges created from conn: {len(self.edge_weight)}")
-            else:
-                print("WARNING: conn is None, will compute functional connectivity after scaling.")
-                self.edge_index = None
-                self.edge_weight = None
-
-            # Patient‑wise split (no leakage)
-            if file_ids is None:
-                raise ValueError("patient_ids must be provided for forecasting tasks")
-            if isinstance(file_ids, list):
-                file_ids = np.array(file_ids)
-            elif isinstance(file_ids, torch.Tensor):
-                file_ids = file_ids.numpy()
-
-            gss = GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=42)
-            train_idx, val_idx = next(gss.split(X_graph, Y, groups=file_ids))
-            X_train_seq = X_graph[train_idx]
-            X_val_seq   = X_graph[val_idx]
-            Y_train_seq = Y[train_idx]
-            Y_val_seq   = Y[val_idx]
-
-            # Ensure 4D shape (B, L, N, F)
-            for name, arr in [("X_train_seq", X_train_seq), ("X_val_seq", X_val_seq)]:
-                if arr.ndim == 3:
-                    n_seq, n_nodes, total_feat = arr.shape
-                    if total_feat % self.seq_len != 0:
-                        raise ValueError(f"Total features {total_feat} not divisible by seq_len {self.seq_len}")
-                    n_feat = total_feat // self.seq_len
-                    arr = arr.reshape(n_seq, self.seq_len, n_nodes, n_feat)
-                    if name == "X_train_seq":
-                        X_train_seq = arr
-                    else:
-                        X_val_seq = arr
-
-            # Scale features (per‑node per‑feature)
-            train_shape = X_train_seq.shape
-            val_shape   = X_val_seq.shape
-            X_train_flat = X_train_seq.reshape(-1, train_shape[-1])
-            X_val_flat   = X_val_seq.reshape(-1, val_shape[-1])
-            self.feature_scaler = StandardScaler()
-            X_train_sc = self.feature_scaler.fit_transform(X_train_flat).reshape(train_shape)
-            X_val_sc   = self.feature_scaler.transform(X_val_flat).reshape(val_shape)
-
-            # ----- Target scaling for regression -----
-            if early_reg:
-                Y_train_log = np.log1p(Y_train_seq)
-                Y_val_log   = np.log1p(Y_val_seq)
-                self.regression_scaler = StandardScaler()
-                Y_train_sc = self.regression_scaler.fit_transform(Y_train_log.reshape(-1, 1)).flatten()
-                Y_val_sc   = self.regression_scaler.transform(Y_val_log.reshape(-1, 1)).flatten()
-                print(f"[Target] log1p+standardise: train mean={Y_train_sc.mean():.3f}, std={Y_train_sc.std():.3f}")
-            else:  # early_clf
-                Y_train_sc = Y_train_seq
-                Y_val_sc   = Y_val_seq
-                unique, counts = np.unique(Y_train_sc, return_counts=True)
-                class_weights = {c: len(Y_train_sc) / (len(unique) * cnt) for c, cnt in zip(unique, counts)}
-                self.class_weights_tensor = torch.tensor([class_weights.get(i, 1.0) for i in range(self.num_classes)],
-                                                        dtype=torch.float, device=self.device)
-
-            # ========== COMPUTE FALLBACK EDGES IF NOT ALREADY SET ==========
-            if self.edge_weight is None:
-                print("Computing functional connectivity from scaled features...")
-                sample = X_train_sc[:min(5000, X_train_sc.shape[0])]  # (B, L, N, F)
-                Bs, Ls, Ns, Fs = sample.shape
-                node_avg = sample.mean(axis=-1).reshape(-1, Ns)      # (B*L, N)
-                corr = np.corrcoef(node_avg.T)                       # (N, N)
-                corr = np.abs(corr)
-                np.fill_diagonal(corr, 0)
-                r, c = np.triu_indices(N, k=1)
-                edge_weight = torch.tensor(corr[r, c], dtype=torch.float32)
-                edge_index = torch.tensor(np.vstack([r, c]), dtype=torch.long)
-                self.edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1).to(self.device)
-                self.edge_weight = torch.cat([edge_weight, edge_weight], dim=0).to(self.device)
-                print(f"Fallback graph edges created: {len(self.edge_weight)}")
-
-                 # Create data loaders (ensure seq_targets is set)
-            train_loader, _, _ = self._sequence_loader_from_arrays(
-                X_train_sc, Y_train_sc, task, shuffle=True
-            )
-            val_loader, _, _ = self._sequence_loader_from_arrays(
-                X_val_sc, Y_val_sc, task, shuffle=False
-            )
-
-  # ====================================================================
-# DETECTION / CLASSIFICATION BRANCH
-# ====================================================================
         else:
-            # Feature extraction
             fb = FeatureBuilder(
-                fs=200, rfft_bins=100,
+                fs=200,
+                rfft_bins=100,
                 with_time=False,
                 with_shapes=True,
                 with_complexity=True,
-                with_connectivity=False
+                with_connectivity=False,
             )
-            X_built = fb.build(X, mode=task)
-            if isinstance(X_built, tuple):
-                X_feat, conn = X_built
-            else:
-                X_feat, conn = X_built, None
-
-            X_graph = X_feat.mean(axis=1)
+            built = fb.build(X, mode=task)
+            X_feat = built[0] if isinstance(built, tuple) else built
+            # Expected FeatureBuilder output is (samples, time, nodes, features).
+            X_graph = X_feat.mean(axis=1) if X_feat.ndim == 4 else X_feat
+            if X_graph.ndim != 3:
+                raise ValueError(
+                    f"Expected graph features (samples,nodes,features), got {X_graph.shape}"
+                )
             in_dim_actual = X_graph.shape[-1]
 
-            if conn is not None:
-                C = conn.mean(axis=0)
-                C = (C + C.T) / 2.0
-                np.fill_diagonal(C, 0.0)
-                r, c = np.tril_indices(C.shape[0], k=-1)
-                w = torch.tensor(C[r, c], dtype=torch.float32, device=self.device)
-                ei = torch.tril_indices(self.num_nodes, self.num_nodes, offset=-1)
-                self.edge_index, self.edge_weight = self._make_undirected(ei, w)
-                self.edge_index = self.edge_index.to(self.device)
-                self.edge_weight = self.edge_weight.to(self.device)
+        print(f"[features] Final X_graph shape={X_graph.shape}; in_dim={in_dim_actual}")
 
-            # Split
-            X_train, X_val, Y_train, Y_val = train_test_split(
-                X_graph, Y, test_size=0.2, random_state=42, stratify=Y
-            )
-
-            # Define Y_train_sc and Y_val_sc for consistency with forecasting branch
-            Y_train_sc = Y_train
-            Y_val_sc = Y_val
-
-            # Scale features
-            self.feature_scaler = StandardScaler()
-            X_train_flat = X_train.reshape(-1, X_train.shape[-1])
-            X_val_flat   = X_val.reshape(-1, X_val.shape[-1])
-            X_train_sc = self.feature_scaler.fit_transform(X_train_flat).reshape(X_train.shape)
-            X_val_sc   = self.feature_scaler.transform(X_val_flat).reshape(X_val.shape)
-
-            # Oversampling (if needed)
-            if detection or classification:
-                uniq = np.unique(Y_train)
-                if len(uniq) > 1:
-                    X_train_sc, Y_train = self.hybrid_oversample(
-                        X_train_sc, Y_train, num_nodes=self.num_nodes, floor=10, smote_cap=1, seed=42
-                    )
-                    # Update Y_train_sc after oversampling
-                    Y_train_sc = Y_train
-                else:
-                    print("Warning: single class; skip oversampling and rely on class weights.")
-
-            # Create loaders
-            train_loader = self.create_graph_batches(X_train_sc, Y_train, task=task, shuffle=True)
-            val_loader   = self.create_graph_batches(X_val_sc,   Y_val,   task=task, shuffle=False)
-
-        # --------------------------------------------------------------------
-        # Create model (shared for all tasks)
-        # --------------------------------------------------------------------
-        self.model = MultiTaskGCN(
-            hidden_dim=self.num_hiddens,
-            in_dim=in_dim_actual,
-            num_classes=self.num_classes,
-            dropout=self.dropout,
-            seq_len=self.seq_len,
-            use_uncertainty=False
-        ).to(self.device)
-
-        print(f"=================== {task.capitalize()} ===================")
-
-        # # ---- Optimizer and scheduler ----
-        # self.optimizer = optim.Adam(
-        #     self.model.parameters(),
-        #     lr=1e-4 if early_reg else self.base_lr,
-        #     weight_decay=1e-3 if early_reg else self.base_wd
-        # )
-        # self.scheduler = (
-        #     ReduceLROnPlateau(self.optimizer, mode="max", factor=0.5, patience=10, min_lr=1e-7)
-        #     if early_reg else
-        #     StepLR(self.optimizer, step_size=10, gamma=0.5)
-        # )
-         # Lower LR and higher weight decay for forecasting
-        lr = 1e-4 if early_reg else 0.005
-        wd = 5e-2 if early_reg else 1e-3
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
-
-        # Scheduler: reduce on plateau (monitor MAE for regression, F1 for classification)
+        # ------------------------------------------------------------
+        # Folds: group-safe and stratified for categorical tasks
+        # ------------------------------------------------------------
         if early_reg:
-            self.optimizer = optim.AdamW(
-                self.model.parameters(), lr=1e-4, weight_decay=5e-2
-            )
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=self.num_epochs, eta_min=1e-6
-            )
+            splitter = GroupKFold(n_splits=actual_splits)
+            split_iter = splitter.split(X_graph, Y, groups=file_ids)
         else:
-            self.optimizer = optim.Adam(
-                self.model.parameters(), lr=self.base_lr, weight_decay=self.base_wd
+            splitter = StratifiedGroupKFold(
+                n_splits=actual_splits,
+                shuffle=True,
+                random_state=random_seed,
             )
-            self.scheduler = StepLR(self.optimizer, step_size=10, gamma=0.5)
-        # if early_reg:
-        #     self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5,
-        #                                     patience=10, min_lr=1e-7)
-        # else:
-        #     self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5,
-        #                                     patience=10, min_lr=1e-7)
+            split_iter = splitter.split(
+                X_graph,
+                Y.astype(int),
+                groups=file_ids
+            )
 
-        # ---- Class weights for classification ----
-        if classification or early_clf:
-            all_classes = np.arange(len(self.real_class_names))
-            present = np.unique(Y_train_sc.astype(int))
-            
-            if len(present) > 1:
-                cw_present = compute_class_weight(
-                    class_weight='balanced',
-                    classes=present,
-                    y=Y_train_sc.astype(int)
-                ).astype(float)
-                
-                class_weights = np.ones(len(all_classes), dtype=float)
-                class_weights[present] = cw_present
-                if len(cw_present) > 0:
-                    class_weights[np.setdiff1d(all_classes, present)] = float(cw_present.max())
-                class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
-                self.adaptive_loss = AdaptiveHeadLoss(smoothing=0.05, focal_gamma=5, class_weights=class_weights)
-                print("[loss] class_weights:", class_weights.detach().cpu().numpy().round(3).tolist())
+        folds = list(split_iter)
 
-                # Give extra weight to minority classes (mysz=4, tnsz=6)
-                # minority_classes = [4,6]
-                # for cls in minority_classes:
-                #     if cls < len(class_weights):
-                #         class_weights[cls] *= 5
-                
-            #     class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
-            #     self.adaptive_loss = AdaptiveHeadLoss(smoothing=0.05, focal_gamma=5, class_weights=class_weights)
-            #     print("[loss] class_weights:", class_weights.detach().cpu().numpy().round(3).tolist())
-            # else:
-            #     print("Warning: only one class in training data, using uniform weights")
-            #     self.adaptive_loss = AdaptiveHeadLoss(smoothing=0.05, focal_gamma=5)
-    
+        # ------------------------------------------------------------
+        # Dataset/fold-summary helpers
+        # ------------------------------------------------------------
+        summary_rows = []
+        fold_metric_rows = []
+        all_oof_true = []
+        all_oof_pred = []
+        all_oof_prob = []
+        best_global_score = -float("inf")
+        best_global_fold = None
+        best_global_checkpoint = None
 
+        def _append_fold_summary(fold_no, split_name, idx):
+            ids = file_ids[idx]
+            yy = Y[idx]
+            n_pat = len(np.unique(ids))
+            summary_rows.append({
+                "fold": fold_no,
+                "split": split_name,
+                "class_id": "ALL",
+                "class_name": "ALL",
+                "samples": len(idx),
+                "percentage": 100.0,
+                "patients": n_pat,
+            })
+            if early_reg:
+                vals = yy.astype(float)
+                summary_rows.append({
+                    "fold": fold_no,
+                    "split": split_name,
+                    "class_id": "REGRESSION",
+                    "class_name": "target",
+                    "samples": len(vals),
+                    "percentage": 100.0,
+                    "patients": n_pat,
+                    "target_min": float(np.min(vals)),
+                    "target_max": float(np.max(vals)),
+                    "target_mean": float(np.mean(vals)),
+                    "target_median": float(np.median(vals)),
+                    "target_std": float(np.std(vals)),
+                })
+            else:
+                all_classes = sorted(np.unique(Y.astype(int)).tolist())
+                for cls in all_classes:
+                    n = int(np.sum(yy.astype(int) == cls))
+                    pct = 100.0 * n / len(yy) if len(yy) else 0.0
+                    summary_rows.append({
+                        "fold": fold_no,
+                        "split": split_name,
+                        "class_id": int(cls),
+                        "class_name": class_name_map.get(int(cls), f"class_{cls}"),
+                        "samples": n,
+                        "percentage": pct,
+                        "patients": n_pat,
+                    })
 
+        def _print_fold_summary(fold_no, train_idx, val_idx):
+            tr_p = np.unique(file_ids[train_idx])
+            va_p = np.unique(file_ids[val_idx])
+            overlap = set(tr_p.tolist()).intersection(set(va_p.tolist()))
+            if overlap:
+                raise RuntimeError(
+                    f"Patient leakage detected in fold {fold_no}: {sorted(overlap)}"
+                )
+            print("\n" + "#" * 86)
+            print(f"FOLD {fold_no}/{actual_splits}")
+            print("#" * 86)
+            print(f"Train samples:       {len(train_idx)}")
+            print(f"Validation samples:  {len(val_idx)}")
+            print(f"Train patients:      {len(tr_p)}")
+            print(f"Validation patients: {len(va_p)}")
+            print(f"Patient overlap:     {len(overlap)}")
 
-        # Training loop
-        # ---- Training loop ----
-        best_val_metric = -float("inf")
-        patience_counter = 0
-        early_stopping_patience = 50
-        epoch_idx, train_trace, val_trace = [], [], []
-        train_preds_list, train_labels_list = [], [] # For confusion matrices
-        all_preds = []  # Initialize for all tasks
-        all_labels = []
-        epoch_idx = []
-        train_trace = []
-        val_trace = [] 
-        import torch.nn.functional as F
-        # Create task-specific directory for checkpoints
-        tag = task
-        task_checkpoint_dir = f"models/checkpoints/{tag}"
-        os.makedirs(task_checkpoint_dir, exist_ok=True)
+            if not early_reg:
+                print("\nTraining class distribution:")
+                for cls in sorted(np.unique(Y.astype(int)).tolist()):
+                    n = int(np.sum(Y[train_idx].astype(int) == cls))
+                    pct = 100.0 * n / len(train_idx)
+                    print(
+                        f"  {cls:>2} {class_name_map.get(cls, str(cls)):<20} "
+                        f"{n:>7} ({pct:6.2f}%)"
+                    )
+                print("\nValidation class distribution:")
+                for cls in sorted(np.unique(Y.astype(int)).tolist()):
+                    n = int(np.sum(Y[val_idx].astype(int) == cls))
+                    pct = 100.0 * n / len(val_idx)
+                    print(
+                        f"  {cls:>2} {class_name_map.get(cls, str(cls)):<20} "
+                        f"{n:>7} ({pct:6.2f}%)"
+                    )
+            else:
+                for name, idx in (("Train", train_idx), ("Validation", val_idx)):
+                    vals = Y[idx].astype(float)
+                    print(
+                        f"{name} target: n={len(vals)}, min={vals.min():.3f}, "
+                        f"max={vals.max():.3f}, mean={vals.mean():.3f}, "
+                        f"median={np.median(vals):.3f}, std={vals.std():.3f}"
+                    )
 
-        print(f"Checkpoints will be saved to: {task_checkpoint_dir}")
+            _append_fold_summary(fold_no, "train", train_idx)
+            _append_fold_summary(fold_no, "validation", val_idx)
 
-        for epoch in range(1, self.num_epochs + 1):
-            self.model.train()
-            epoch_loss = 0.0
-            all_preds, all_labels = [], []
-            train_preds_epoch, train_labels_epoch = [], []  # For epoch-level storage
+        def _set_fold_graph_from_training(X_train_scaled):
+            """Create fold-local functional edge weights from training data only."""
+            if X_train_scaled.ndim == 4:
+                # sequences x windows x nodes x features
+                node_matrix = X_train_scaled.mean(axis=-1).reshape(-1, self.num_nodes)
+            elif X_train_scaled.ndim == 3:
+                node_matrix = X_train_scaled.mean(axis=-1)
+            else:
+                raise ValueError(f"Unsupported graph array shape {X_train_scaled.shape}")
 
-            for batch in train_loader:
-                batch = batch.to(self.device)
-                self.optimizer.zero_grad()
-                ew = getattr(batch, "edge_weight", None)
+            if node_matrix.shape[0] < 2:
+                corr = np.eye(self.num_nodes, dtype=np.float32)
+            else:
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    corr = np.corrcoef(node_matrix.T)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+            corr = np.abs((corr + corr.T) / 2.0)
+            np.fill_diagonal(corr, 0.0)
 
-                if detection:
-                    out = self.model(batch.x, batch.edge_index, batch, task="detection", edge_weight=ew).squeeze(-1)
-                    loss = self.adaptive_loss.detection_loss(out, batch.y.float())
-                    preds = (torch.sigmoid(out) > 0.5).detach().cpu().numpy()
-                    labels = batch.y.detach().cpu().numpy()
+            r, c = np.tril_indices(self.num_nodes, k=-1)
+            weights = corr[r, c].astype(np.float32)
+            if np.allclose(weights, 0):
+                weights = np.ones_like(weights, dtype=np.float32)
 
-                elif classification:
-                    out = self.model(batch.x, batch.edge_index, batch, task="classification", edge_weight=ew)
-                    loss = self.adaptive_loss.classification_loss(out, batch.y,
-                                                                num_classes=self.model.class_head[-1].out_features)
-                    preds = out.argmax(dim=1).detach().cpu().numpy()
-                    labels = batch.y.detach().cpu().numpy()
+            edge_index = torch.tensor(np.vstack([r, c]), dtype=torch.long)
+            edge_weight = torch.tensor(weights, dtype=torch.float32)
+            self.edge_index, self.edge_weight = self._make_undirected(edge_index, edge_weight)
+            self.edge_index = self.edge_index.to(self.device)
+            self.edge_weight = self.edge_weight.to(self.device)
 
-                elif early_reg:
-                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_time", edge_weight=ew)
-                    # loss = self.adaptive_loss.regression_loss(out, batch.seq_targets.float())
-                    loss = F.smooth_l1_loss(out.squeeze(), batch.seq_targets.float())
-                    preds = out.detach().cpu().numpy().flatten()
-                    labels = batch.seq_targets.detach().cpu().numpy().flatten()
-                    all_preds.extend(preds)
-                    all_labels.extend(labels)
+        def _make_model():
+            model = MultiTaskGCN(
+                hidden_dim=self.num_hiddens,
+                in_dim=in_dim_actual,
+                num_classes=self.num_classes,
+                dropout=self.dropout,
+                seq_len=self.seq_len,
+                use_uncertainty=False,
+            ).to(self.device)
 
-                else:  # early_clf
-                    out = self.model(batch.x, batch.edge_index, batch, task="forecast_label", edge_weight=ew)
-                    loss = self.adaptive_loss.classification_loss(out, batch.seq_targets,
-                                                                num_classes=self.model.label_head[-1].out_features)
-                    preds = out.argmax(dim=1).detach().cpu().numpy()
-                    labels = batch.seq_targets.detach().cpu().numpy()
+            if backbone_ckpt and os.path.exists(backbone_ckpt):
+                n = model.load_backbone(backbone_ckpt, strict=True)
+                print(f"[shared] loaded backbone ({n} tensors) from {backbone_ckpt}")
+            if freeze_backbone:
+                model.freeze_backbone()
+                print("[shared] backbone FROZEN")
+            if gru_ckpt and os.path.exists(gru_ckpt):
+                n = model.load_temporal(gru_ckpt, strict=True)
+                print(f"[shared] loaded GRU ({n} tensors) from {gru_ckpt}")
+            if freeze_gru:
+                model.freeze_temporal()
+                print("[shared] GRU FROZEN")
+            return model
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                epoch_loss += loss.item()
-                
-                if not early_reg:
-                    all_preds.extend(preds)
-                    all_labels.extend(labels)
-                
-                train_preds_epoch.extend(preds)
-                train_labels_epoch.extend(labels)
-
-            avg_loss = epoch_loss / len(train_loader)
-            
-            # Store for final confusion matrix
-            train_preds_list.extend(train_preds_epoch)
-            train_labels_list.extend(train_labels_epoch)
+        # def _evaluate(loader, regression_scaler=None):
+        #     self.model.eval()
+        #     y_true, y_pred, y_prob = [], [], []
+        #     with torch.no_grad():
+        #         for batch in loader:
+        #             batch = batch.to(self.device)
+        #             ew = getattr(batch, "edge_weight", None)
+        #             if detection:
+        #                 logits = self.model(
+        #                     batch.x, batch.edge_index, batch,
+        #                     task="detection", edge_weight=ew
+        #                 ).squeeze(-1)
+        #                 prob = torch.sigmoid(logits)
+        #                 pred = (prob >= 0.5).long()
+        #                 target = batch.y.long().view(-1)
+        #                 y_true.extend(target.detach().cpu().numpy().tolist())
+        #                 y_pred.extend(pred.detach().cpu().numpy().tolist())
+        #                 y_prob.extend(prob.detach().cpu().numpy().tolist())
+        #             elif classification:
+        #                 logits = self.model(
+        #                     batch.x, batch.edge_index, batch,
+        #                     task="classification", edge_weight=ew
+        #                 )
+        #                 prob = torch.softmax(logits, dim=1)
+        #                 pred = prob.argmax(dim=1)
+        #                 target = batch.y.long().view(-1)
+        #                 y_true.extend(target.detach().cpu().numpy().tolist())
+        #                 y_pred.extend(pred.detach().cpu().numpy().tolist())
+        #                 y_prob.extend(prob.detach().cpu().numpy().tolist())
+        #             elif early_clf:
+        #                 logits = self.model(
+        #                     batch.x, batch.edge_index, batch,
+        #                     task="forecast_label", edge_weight=ew
+        #                 )
+        #                 prob = torch.softmax(logits, dim=1)
+        #                 pred = prob.argmax(dim=1)
+        #                 target = batch.seq_targets.long().view(-1)
+        #                 y_true.extend(target.detach().cpu().numpy().tolist())
+        #                 y_pred.extend(pred.detach().cpu().numpy().tolist())
+        #                 y_prob.extend(prob.detach().cpu().numpy().tolist())
+        #             else:
+        #                 out = self.model(
+        #                     batch.x, batch.edge_index, batch,
+        #                     task="forecast_time", edge_weight=ew
+        #                 ).view(-1)
+        #                 target = batch.seq_targets.float().view(-1)
+        #                 pred_sc = out.detach().cpu().numpy()
+        #                 true_sc = target.detach().cpu().numpy()
+        #                 if regression_scaler is not None:
+        #                     pred_log = regression_scaler.inverse_transform(
+        #                         pred_sc.reshape(-1, 1)
+        #                     ).reshape(-1)
+        #                     true_log = regression_scaler.inverse_transform(
+        #                         true_sc.reshape(-1, 1)
+        #                     ).reshape(-1)
+        #                     pred_raw = np.expm1(pred_log)
+        #                     true_raw = np.expm1(true_log)
+        #                 else:
+        #                     pred_raw, true_raw = pred_sc, true_sc
+        #                 y_true.extend(true_raw.tolist())
+        #                 y_pred.extend(pred_raw.tolist())
+        #     return np.asarray(y_true), np.asarray(y_pred), np.asarray(y_prob)
+        
+        def _evaluate(loader, regression_scaler=None):
             self.model.eval()
-            val_preds, val_labels = [], []
+
+            y_true, y_pred, y_prob = [], [], []
+
             with torch.no_grad():
-                for batch in val_loader:
+                for batch in loader:
                     batch = batch.to(self.device)
                     ew = getattr(batch, "edge_weight", None)
 
                     if detection:
-                        out = self.model(batch.x, batch.edge_index, batch, task="detection", edge_weight=ew).squeeze(-1)
-                        preds = (torch.sigmoid(out) > 0.5).cpu().numpy()
-                        targets = batch.y.cpu().numpy()
-                    elif classification:
-                        out = self.model(batch.x, batch.edge_index, batch, task="classification", edge_weight=ew)
-                        preds = out.argmax(dim=1).cpu().numpy()
-                        targets = batch.y.cpu().numpy()
-                    elif early_reg:
-                        # out_sc = self.model(batch.x, batch.edge_index, batch, task="forecast_time", edge_weight=ew).cpu().numpy().flatten()
-                        # # Inverse transform to original scale
-                        # preds = np.expm1(self.regression_scaler.inverse_transform(out_sc.reshape(-1, 1))).flatten()
-                        # targets = batch.seq_targets.cpu().numpy().flatten()
-                        # targets_raw = np.expm1(self.regression_scaler.inverse_transform(targets.reshape(-1, 1))).flatten()
-                        # val_preds.extend(preds)
-                        # val_labels.extend(targets_raw)
-                        out = self.model(batch.x, batch.edge_index, batch, task="forecast_time", edge_weight=ew)
-                        preds = out.detach().cpu().numpy().flatten()
-                        targets = batch.seq_targets.detach().cpu().numpy().flatten()
-                        val_preds.extend(preds)
-                        val_labels.extend(targets)
-                    else:  # early_clf
-                        out = self.model(batch.x, batch.edge_index, batch, task="forecast_label", edge_weight=ew)
-                        preds = out.argmax(dim=1).cpu().numpy()
-                        targets = batch.seq_targets.cpu().numpy()
+                        logits = self.model(
+                            batch.x,
+                            batch.edge_index,
+                            batch,
+                            task="detection",
+                            edge_weight=ew
+                        ).reshape(-1)
 
-                    val_preds.extend(preds)
-                    val_labels.extend(targets)
+                        prob = torch.sigmoid(logits)
+                        pred = (prob >= 0.5).long()
+                        target = batch.y.long().reshape(-1)
 
-            
-            # Metrics
-            if early_reg:
-                train_preds_raw = self.regression_scaler.inverse_transform(
-                    np.array(all_preds).reshape(-1, 1)
-                ).flatten()
-                train_labels_raw = self.regression_scaler.inverse_transform(
-                    np.array(all_labels).reshape(-1, 1)
-                ).flatten()
-                # R² is scale-invariant, RMSE needs original scale
-                train_r2 = self.safe_r2_score(train_labels_raw, train_preds_raw)
-                train_rmse = np.sqrt(mean_squared_error(train_labels_raw, train_preds_raw))
-                
-                val_preds_raw = self.regression_scaler.inverse_transform(
-                    np.array(val_preds).reshape(-1, 1)
-                ).flatten()
-                val_labels_raw = self.regression_scaler.inverse_transform(
-                    np.array(val_labels).reshape(-1, 1)
-                ).flatten()
-                val_r2 = self.safe_r2_score(val_labels_raw, val_preds_raw)
-                val_rmse = np.sqrt(mean_squared_error(val_labels_raw, val_preds_raw))
-                        # # ---- Metrics ----
-            # if early_reg:
-            #     train_preds_flat = np.array(all_preds)
-            #     train_labels_flat = np.array(all_labels)
-            #     train_preds_raw = train_preds_flat
-            #     train_labels_raw = train_labels_flat
-
-            #     valid_mask = np.isfinite(train_labels_raw) & np.isfinite(train_preds_raw)
-            #     if valid_mask.sum() > 1:
-            #         train_r2 = self.safe_r2_score(train_labels_raw[valid_mask], train_preds_raw[valid_mask])
-            #         train_rmse = np.sqrt(mean_squared_error(train_labels_raw[valid_mask], train_preds_raw[valid_mask]))
-            #     else:
-            #         train_r2 = -float('inf')
-            #         train_rmse = float('inf')
-
-            #     val_preds_flat = np.array(val_preds)
-            #     val_labels_flat = np.array(val_labels)
-                
-            #     valid_mask_val = np.isfinite(val_labels_flat) & np.isfinite(val_preds_flat)
-            #     if valid_mask_val.sum() > 1:
-            #         val_r2 = self.safe_r2_score(val_labels_flat[valid_mask_val], val_preds_flat[valid_mask_val])
-            #         val_rmse = np.sqrt(mean_squared_error(val_labels_flat[valid_mask_val], val_preds_flat[valid_mask_val]))
-            #     else:
-            #         val_r2 = -float('inf')
-            #         val_rmse = float('inf')
-                
-                val_metric = val_r2
-                
-                # Store values (replace inf/nan with 0 for plotting)
-                train_trace_value = train_r2 if np.isfinite(train_r2) else 0.0
-                val_trace_value = val_r2 if np.isfinite(val_r2) else 0.0
-                
-                epoch_idx.append(epoch)
-                train_trace.append(train_r2 if not np.isnan(train_r2) else 0.0)
-                val_trace.append(val_r2 if not np.isnan(val_r2) else 0.0)
-                        
-                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | "
-                    f"Train R2: {train_r2:.4f}, RMSE: {train_rmse:.2f}s | "
-                    f"Val R2: {val_r2:.4f}, RMSE: {val_rmse:.2f}s")
-            else:
-                # Detection or Classification
-                train_acc = accuracy_score(all_labels, all_preds)
-                val_acc = accuracy_score(val_labels, val_preds)
-                train_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-                val_f1 = f1_score(val_labels, val_preds, average="macro", zero_division=0)
-                val_metric = val_f1
-                
-                # Store values (ensure finite)
-                train_trace_value = train_acc if np.isfinite(train_acc) else 0.0
-                val_trace_value = val_acc if np.isfinite(val_acc) else 0.0
-                
-                train_acc = accuracy_score(all_labels, all_preds)
-                val_acc = accuracy_score(val_labels, val_preds)
-                
-                epoch_idx.append(epoch)
-                train_trace.append(train_acc if not np.isnan(train_acc) else 0.0)
-                val_trace.append(val_acc if not np.isnan(val_acc) else 0.0)
-                
-                print(f"Epoch {epoch}/{self.num_epochs} - Loss: {avg_loss:.4f} | "
-                    f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | "
-                    f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
-                
-            
-            # ====================================================================
-            # CHECKPOINTING - TASK SPECIFIC
-            # ====================================================================
-            if val_metric > best_val_metric:
-                best_val_metric = val_metric
-                patience_counter = 0
-                
-                # Save best model with task name
-                torch.save(
-                    {
-                        "model_state_dict": self.model.state_dict(),
-                        "optimizer_state_dict": self.optimizer.state_dict(),
-                        "scheduler_state_dict": None if isinstance(self.scheduler, ReduceLROnPlateau) else self.scheduler.state_dict(),
-                        "val_metric": best_val_metric,
-                        "epoch": epoch,
-                        "task": task,
-                        "num_nodes": self.num_nodes,
-                        "hidden_dim": self.num_hiddens,
-                        "seq_len": self.seq_len,
-                        "num_classes": self.num_classes,
-                        "dropout": self.dropout,
-                    },
-                    f"{task_checkpoint_dir}/{tag}_best.pth"
-                )
-                print(f"✓ Best {task} model saved to {task_checkpoint_dir}/{tag}_best.pth (val_metric={best_val_metric:.4f})")
-            else:
-                patience_counter += 1
-
-            # Save periodic checkpoint (every 10 epochs)
-            if epoch % 10 == 0:
-                torch.save(
-                    {
-                        "model_state_dict": self.model.state_dict(),
-                        "optimizer_state_dict": self.optimizer.state_dict(),
-                        "epoch": epoch,
-                        "task": task,
-                        "val_metric": val_metric,
-                    },
-                    f"{task_checkpoint_dir}/{tag}_epoch_{epoch}.pth"
-                )
-                print(f"  Checkpoint saved: {task_checkpoint_dir}/{tag}_epoch_{epoch}.pth")
-
-            if patience_counter >= early_stopping_patience:
-                print(f"Early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs).")
-                break
-
-            if isinstance(self.scheduler, ReduceLROnPlateau):
-                self.scheduler.step(val_metric)
-            else:
-                self.scheduler.step()
-
-        # After training loop, print summary of saved models
-        print(f"\n{'='*60}")
-        print(f"TRAINING COMPLETE FOR TASK: {task.upper()}")
-        print(f"{'='*60}")
-        print(f"Best model saved to: {task_checkpoint_dir}/{tag}_best.pth")
-        print(f"Best validation metric: {best_val_metric:.4f}")
-        print(f"Checkpoints directory: {task_checkpoint_dir}")
-        print(f"{'='*60}\n")
-
-        if detection or classification or early_reg or early_clf:
-            # Generate interpretability visualizations
-                self.generate_interpretability_visualizations(val_loader, task)
-
-
-    # ====================================================================
-# POST-TRAINING VISUALIZATIONS (Complete Section)
-# ====================================================================
-        if val_loader is not None:
-            try:
-                out_prefix = f"{task}"
-                
-                # Create task-specific directory for visualizations
-                viz_task_dir = os.path.join(self.viz.out_dir, task)
-                os.makedirs(viz_task_dir, exist_ok=True)
-                
-                print(f"\n{'='*60}")
-                print(f"GENERATING VISUALIZATIONS FOR {task.upper()}")
-                print(f"{'='*60}")
-                
-                # ========== 1. NODE (CHANNEL) PERMUTATION IMPORTANCE ==========
-                try:
-                    ni = NodeInterpreter(self.model, num_nodes=self.num_nodes, device=self.device)
-                    base_metric, node_drop = ni.permutation_importance(val_loader, task=task, n_repeats=8, seed=7)
-                    rows = [(self.channel_names[i], float(node_drop[i])) for i in range(len(node_drop))]
-                    self.viz.save_csv_columns(rows, header=["channel", "importance_drop"], 
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_node_importance.csv"))
-                    self.viz.barh(node_drop, self.channel_names,
-                                title=f"Node importance (perm drop) — {task} (base={base_metric:.3f})",
-                                fname=os.path.join(viz_task_dir, f"{out_prefix}_node_importance.png"), top_k=20)
-                    self.viz.radar(node_drop, self.channel_names,
-                                title=f"Node Importance — {task} (base={base_metric:.3f})",
-                                fname=os.path.join(viz_task_dir, f"{out_prefix}_radar_nodes.png"))
-                    print(f"  ✓ Node permutation importance saved")
-                except Exception as e:
-                    print(f"  ✗ Node permutation importance skipped: {e}")
-
-                # ========== 2. FEATURE GROUP PERMUTATION IMPORTANCE ==========
-                try:
-                    fi = FeatureInterpreter(self.model, num_nodes=self.num_nodes, device=self.device)
-                    in_dim_actual = self.model.conv1.lin.in_channels if hasattr(self.model.conv1, 'lin') else self.num_features_cfg
-                    
-                    feat_groups = fi.default_groups(
-                        in_dim=in_dim_actual,
-                        task=task,
-                        with_shapes=True,
-                        with_complexity=True
-                    )
-                    
-                    # Only use groups that fit within the actual dimension
-                    max_idx = max([group[1].max() for group in feat_groups]) if feat_groups else 0
-                    if max_idx < in_dim_actual:
-                        group_names, group_drops, base_feat = fi.permutation_importance_by_group(
-                            val_loader, feat_groups, task=task, n_repeats=5
+                        y_true.extend(
+                            target.detach().cpu().numpy().reshape(-1).tolist()
                         )
-                    rows = list(zip(group_names, map(float, group_drops)))
-                    self.viz.save_csv_columns(rows, header=["feature_group", "importance_drop"],
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_feature_groups.csv"))
-                    self.viz.radar(group_drops, group_names,
-                                title=f"Feature-Group Importance — {task} (base={base_feat:.3f})",
-                                fname=os.path.join(viz_task_dir, f"{out_prefix}_radar_features.png"))
-                    print(f"  ✓ Feature group importance saved")
-                except Exception as e:
-                    print(f"  ✗ Feature group importance skipped: {e}")
+                        y_pred.extend(
+                            pred.detach().cpu().numpy().reshape(-1).tolist()
+                        )
+                        y_prob.extend(
+                            prob.detach().cpu().numpy().reshape(-1).tolist()
+                        )
 
-                # ========== 3. BAND IMPORTANCE ==========
-                try:
-                    fi = FeatureInterpreter(self.model, num_nodes=self.num_nodes, device=self.device)
-                    band_groups = fi.band_groups(task=task, in_dim=in_dim_actual, rfft_bins=100)
-                    bnames, bdrops, _ = fi.permutation_importance_by_group(
-                        val_loader, band_groups, task=task, n_repeats=4
-                    )
-                    self.viz.save_csv_columns(list(zip(bnames, map(float, bdrops))),
-                                            header=["band", "importance_drop"],
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_band_importance.csv"))
-                    
-                    # Soft outer-product for per-node-per-band heatmap
-                    node_imp = np.asarray(node_drop, float)
-                    node_imp = np.maximum(node_imp, 0)
-                    if node_imp.max() > 0:
-                        node_imp = node_imp / (node_imp.max() + 1e-12)
-                    band_imp = np.asarray(bdrops, float)
-                    band_imp = np.maximum(band_imp, 0)
-                    if band_imp.max() > 0:
-                        band_imp = band_imp / (band_imp.max() + 1e-12)
-                    band_node = {bn: (band_imp[i] * node_imp) for i, bn in enumerate(bnames)}
-                    self.viz.band_node_heatmap(band_node, self.channel_names,
-                                            title=f"Band × Node (soft attribution) — {task}",
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_band_node.png"))
-                    print(f"  ✓ Band importance saved")
-                except Exception as e:
-                    print(f"  ✗ Band importance skipped: {e}")
-
-                # ========== 4. EDGE WEIGHT VISUALIZATIONS ==========
-                try:
-                    if self.edge_weight is not None:
-                        ew = self.edge_weight.detach().cpu().numpy()
-                        n = self.num_nodes
-                        A = np.zeros((n, n), dtype=float)
-                        half = ew.size // 2
-                        w = ew[:half]
-                        r, c = np.tril_indices(n, k=-1)
-                        A[r, c] = w
-                        A[c, r] = w
-                        self.viz.heatmap(A, self.channel_names, self.channel_names,
-                                        title=f"Edge weights used by GCN — {task}",
-                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_edge_weights_heatmap.png"))
-                        self.viz.connectogram(A, self.channel_names,
-                                            title=f"Connectogram — {task}",
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_connectogram.png"),
-                                            top_k=50)
-                        print(f"  ✓ Edge weight visualizations saved")
-                except Exception as e:
-                    print(f"  ✗ Edge weight visuals skipped: {e}")
-
-                # ========== 5. TASK-SPECIFIC PLOTS ==========
-                try:
-                    if detection:
-                        # Detection: ROC, PR, Calibration, Confusion Matrix
-                        ys, ps = [], []
-                        with torch.no_grad():
-                            for b in val_loader:
-                                b = b.to(self.device)
-                                ew = getattr(b, "edge_weight", None)
-                                logit = self.model(b.x, b.edge_index, b, task="detection", edge_weight=ew)
-                                ys.extend(b.y.detach().cpu().numpy().tolist())
-                                ps.extend(torch.sigmoid(logit).detach().cpu().numpy().tolist())
-                        ys = np.asarray(ys, int)
-                        ps = np.asarray(ps, float)
-                        
-                        self.viz.roc_binary(ys, ps, title=f"ROC — detection", 
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_roc.png"))
-                        self.viz.pr_curve(ys, ps, title=f"PR — detection", 
-                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_pr.png"))
-                        self.viz.reliability_curve(ys, ps, title=f"Calibration — detection", 
-                                                fname=os.path.join(viz_task_dir, f"{out_prefix}_calibration.png"))
-                        self.viz.roc_with_ci(ys, ps, title=f"ROC (95% CI) — detection", 
-                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_roc_ci.png"))
-                        self.viz.confusion(ys, (ps > 0.5).astype(int),
-                                        class_names=["non-seizure", "seizure"],
-                                        title=f"Confusion — detection", 
-                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_cm.png"))
-                        self.viz.confusion(np.array(train_labels_list), np.array(train_preds_list),
-                                        class_names=["non-seizure", "seizure"],
-                                        title=f"Confusion (Train) — detection", 
-                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_cm_train.png"))
-                        print(f"  ✓ Detection plots saved (ROC, PR, Calibration, Confusion)")
                     elif classification:
-                        try:
-                            # Collect validation predictions
-                            ys, logits_all = [], []
-                            with torch.no_grad():
-                                for b in val_loader:
-                                    b = b.to(self.device)
-                                    ew = getattr(b, "edge_weight", None)
-                                    logits = self.model(b.x, b.edge_index, b, task="classification", edge_weight=ew)
-                                    ys.extend(b.y.detach().cpu().numpy().tolist())
-                                    logits_all.append(logits.detach().cpu().numpy())
-                            
-                            ys = np.asarray(ys, int)
-                            logits_all = np.concatenate(logits_all, axis=0)
-                            probs = torch.softmax(torch.tensor(logits_all), dim=1).numpy()
-                            yhat = probs.argmax(axis=1)
-                            
-                            # Get UNIQUE classes present in validation data
-                            val_unique_classes = np.unique(ys)
-                            val_n_classes = len(val_unique_classes)
-                            print(f"  Unique classes in validation set: {val_unique_classes} (Count: {val_n_classes})")
-                            print(f"  Unique classes in predictions: {np.unique(yhat)}")
-                            
-                            # Create mapping for validation classes (0,1,2 for classes 0,1,5)
-                            val_class_to_idx = {cls: idx for idx, cls in enumerate(val_unique_classes)}
-                            
-                            # Create a safe mapping function that handles unknown classes
-                            def safe_map(label, mapping, default=0):
-                                """Map label to index, return default if label not in mapping"""
-                                return mapping.get(label, default)
-                            
-                            # Map validation labels to consecutive indices
-                            ys_mapped = np.array([safe_map(y, val_class_to_idx) for y in ys])
-                            
-                            # Filter predictions to only include classes in mapping
-                            # For unknown predictions, we'll map to the closest class or ignore
-                            valid_pred_mask = np.isin(yhat, val_unique_classes)
-                            n_invalid = np.sum(~valid_pred_mask)
-                            if n_invalid > 0:
-                                print(f"  Warning: {n_invalid} predictions for classes not in validation set: {np.unique(yhat[~valid_pred_mask])}")
-                            
-                            # For confusion matrix, only use valid predictions
-                            yhat_filtered = yhat[valid_pred_mask]
-                            ys_filtered = ys[valid_pred_mask]
-                            
-                            if len(yhat_filtered) > 0:
-                                yhat_mapped = np.array([safe_map(y, val_class_to_idx) for y in yhat_filtered])
-                                ys_mapped_filtered = np.array([safe_map(y, val_class_to_idx) for y in ys_filtered])
-                                
-                                # Get class names for validation classes
-                                val_class_names = []
-                                for cls in val_unique_classes:
-                                    if cls < len(self.real_class_names):
-                                        val_class_names.append(self.real_class_names[cls])
-                                    else:
-                                        val_class_names.append(f"class_{cls}")
-                                
-                                print(f"  Validation class names: {val_class_names}")
-                                
-                                # Plot validation confusion matrix
-                                self.viz.confusion(ys_mapped_filtered, yhat_mapped, class_names=val_class_names,
-                                                title=f"Confusion — classification (Validation)",
-                                                fname=os.path.join(viz_task_dir, f"{out_prefix}_cm.png"), 
-                                                normalize=False)
-                            else:
-                                print(f"  Warning: No valid predictions for classes in validation set")
-                            
-                            # ========== TRAINING CONFUSION MATRIX ==========
-                            if len(train_labels_list) > 0 and len(train_preds_list) > 0:
-                                train_labels = np.array(train_labels_list)
-                                train_preds = np.array(train_preds_list)
-                                
-                                # Filter to validation classes only
-                                train_mask = np.isin(train_labels, val_unique_classes)
-                                train_labels_filtered = train_labels[train_mask]
-                                train_preds_filtered = train_preds[train_mask]
-                                
-                                # Also filter predictions to validation classes
-                                train_pred_mask = np.isin(train_preds_filtered, val_unique_classes)
-                                train_labels_filtered = train_labels_filtered[train_pred_mask]
-                                train_preds_filtered = train_preds_filtered[train_pred_mask]
-                                
-                                if len(train_labels_filtered) > 0:
-                                    train_labels_mapped = np.array([safe_map(y, val_class_to_idx) for y in train_labels_filtered])
-                                    train_preds_mapped = np.array([safe_map(y, val_class_to_idx) for y in train_preds_filtered])
-                                    
-                                    self.viz.confusion(train_labels_mapped, train_preds_mapped, class_names=val_class_names,
-                                                    title=f"Confusion — classification (Training)",
-                                                    fname=os.path.join(viz_task_dir, f"{out_prefix}_cm_train.png"), 
-                                                    normalize=False)
-                            
-                            # ========== METRICS FOR VALIDATION CLASSES ==========
-                            if val_n_classes > 1 and len(yhat_filtered) > 0:
-                                precision, recall, f1, _ = precision_recall_fscore_support(ys_mapped_filtered, yhat_mapped, 
-                                                                                            labels=range(val_n_classes), 
-                                                                                            average='weighted')
-                                print(f"  Post-Training Metrics — Classification: Precision: {precision:.4f}, "
-                                    f"Recall: {recall:.4f}, F1: {f1:.4f}")
-                            
-                            # ========== PER-CLASS CURVES (Only for validation classes) ==========
-                            for idx, cls in enumerate(val_unique_classes):
-                                # Create binary labels for this class (1 if this class, 0 otherwise)
-                                y_bin = (ys == cls).astype(int)
-                                
-                                # Get probability for this class
-                                if cls < probs.shape[1]:
-                                    p_bin = probs[:, cls]
-                                else:
-                                    print(f"  Warning: class {cls} out of probs range {probs.shape[1]}, skipping")
-                                    continue
-                                
-                                class_name = self.real_class_names[cls] if cls < len(self.real_class_names) else f"class_{cls}"
-                                
-                                n_pos = np.sum(y_bin)
-                                n_neg = len(y_bin) - n_pos
-                                print(f"    Class {cls} ({class_name}): {n_pos} positive, {n_neg} negative samples")
-                                
-                                # Only generate curves if we have both positive and negative samples
-                                if n_pos > 0 and n_neg > 0:
-                                    self.viz.pr_curve(y_bin, p_bin, title=f"PR — class {class_name}", 
-                                                    fname=os.path.join(viz_task_dir, f"{out_prefix}_pr_c{cls}.png"))
-                                    self.viz.reliability_curve(y_bin, p_bin, title=f"Calibration — class {class_name}", 
-                                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_calib_c{cls}.png"))
-                                    self.viz.roc_with_ci(y_bin, p_bin, title=f"ROC (95% CI) — class {class_name}", 
-                                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_roc_ci_c{cls}.png"))
-                                else:
-                                    print(f"    Skipping curves for class {class_name} (need both positive and negative samples)")
-                            
-                            print(f"  ✓ Classification plots saved for {val_n_classes} classes")
-                            
-                        except Exception as e:
-                            print(f"  ✗ Classification visuals failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    elif early_reg:
-                        # Regression: Scatter, Residuals, Bland-Altman
-                       # ========== Helper function for best‑fit line ==========
-                        def add_best_fit_line(ax, x, y, color='red'):
-                            """Add linear regression line and return R²."""
-                            mask = np.isfinite(x) & np.isfinite(y)
-                            x_clean, y_clean = x[mask], y[mask]
-                            if len(x_clean) < 2:
-                                return None
-                            slope, intercept = np.polyfit(x_clean, y_clean, 1)
-                            r2 = r2_score(y_clean, slope * x_clean + intercept)
-                            x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
-                            y_line = slope * x_line + intercept
-                            ax.plot(x_line, y_line, color=color, linestyle='-', linewidth=2,
-                                    label=f'Best fit: y={slope:.2f}x+{intercept:.2f} (R²={r2:.3f})')
-                            return r2
+                        logits = self.model(
+                            batch.x,
+                            batch.edge_index,
+                            batch,
+                            task="classification",
+                            edge_weight=ew
+                        ).reshape(-1, self.num_classes)
 
-                        # ========== Helper function for Bland‑Altman ==========
-                        def plot_bland_altman(y_true, y_pred, title, fname):
-                            mean = (y_true + y_pred) / 2
-                            diff = y_true - y_pred
-                            bias = np.mean(diff)
-                            std_diff = np.std(diff)
-                            loa_upper = bias + 1.96 * std_diff
-                            loa_lower = bias - 1.96 * std_diff
-                            plt.figure(figsize=(6, 4), dpi=150)
-                            plt.scatter(mean, diff, s=15, alpha=0.6, edgecolors='k', linewidth=0.5)
-                            plt.axhline(bias, color='red', linestyle='-', linewidth=2, label=f'Bias: {bias:.2f} s')
-                            plt.axhline(loa_upper, color='gray', linestyle='--', linewidth=1.5,
-                                        label=f'95% LoA: [{loa_lower:.2f}, {loa_upper:.2f}] s')
-                            plt.axhline(loa_lower, color='gray', linestyle='--', linewidth=1.5)
-                            plt.xlabel('Mean of true and predicted (s)', fontsize=12)
-                            plt.ylabel('Difference (true - predicted) (s)', fontsize=12)
-                            plt.title(title, fontsize=14)
-                            plt.legend(loc='best', fontsize=9)
-                            plt.grid(alpha=0.3)
-                            plt.tight_layout()
-                            plt.savefig(fname, dpi=300, bbox_inches='tight')
-                            plt.close()
+                        prob = torch.softmax(logits, dim=1)
+                        pred = prob.argmax(dim=1)
+                        target = batch.y.long().reshape(-1)
 
-                        # ========== VALIDATION PLOTS ==========
-                        # Collect predictions
-                        y_true, y_pred = [], []
-                        with torch.no_grad():
-                            for b in val_loader:
-                                b = b.to(self.device)
-                                ew = getattr(b, "edge_weight", None)
-                                pred_sc = self.model(b.x, b.edge_index, b, task="forecast_time", edge_weight=ew).cpu().numpy()
-                                true_sc = b.seq_targets.cpu().numpy()
-                                if self.regression_scaler is not None:
-                                    y_pred.extend(np.expm1(self.regression_scaler.inverse_transform(pred_sc.reshape(-1, 1))).flatten())
-                                    y_true.extend(np.expm1(self.regression_scaler.inverse_transform(true_sc.reshape(-1, 1))).flatten())
-                                else:
-                                    y_pred.extend(pred_sc.flatten())
-                                    y_true.extend(true_sc.flatten())
-                        y_true = np.array(y_true, dtype=float)
-                        y_pred = np.array(y_pred, dtype=float)
+                        y_true.extend(
+                            target.detach().cpu().numpy().reshape(-1).tolist()
+                        )
+                        y_pred.extend(
+                            pred.detach().cpu().numpy().reshape(-1).tolist()
+                        )
+                        y_prob.extend(
+                            prob.detach().cpu().numpy().tolist()
+                        )
 
-                        # 1. Scatter plot with best‑fit line
-                        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-                        ax.scatter(y_true, y_pred, s=15, alpha=0.6, edgecolors='k', linewidth=0.5, label='Predictions')
-                        add_best_fit_line(ax, y_true, y_pred)
-                        # Diagonal y=x line
-                        lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
-                        ax.plot(lims, lims, 'k--', alpha=0.5, label='Ideal (y=x)')
-                        ax.set_xlabel('True TTI (s)', fontsize=12)
-                        ax.set_ylabel('Predicted TTI (s)', fontsize=12)
-                        ax.set_title('Early regression — validation set', fontsize=14)
-                        ax.legend(loc='best', fontsize=9)
-                        ax.grid(True, alpha=0.3)
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(viz_task_dir, f"{out_prefix}_reg_scatter.png"), dpi=300, bbox_inches='tight')
-                        plt.close()
+                    elif early_clf:
+                        logits = self.model(
+                            batch.x,
+                            batch.edge_index,
+                            batch,
+                            task="forecast_label",
+                            edge_weight=ew
+                        ).reshape(-1, self.num_classes)
 
-                        # 2. Residuals histogram with normal fit
-                        residuals = y_pred - y_true
-                        fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
-                        n, bins, patches = ax.hist(residuals, bins=30, density=True, alpha=0.7, color='steelblue',
-                                                edgecolor='black', linewidth=0.8)
-                        mu, std = np.mean(residuals), np.std(residuals)
-                        x_fit = np.linspace(residuals.min(), residuals.max(), 200)
-                        from scipy.stats import norm
-                        pdf_fit = norm.pdf(x_fit, mu, std)
-                        ax.plot(x_fit, pdf_fit, 'r-', linewidth=2, label=f'Normal fit (μ={mu:.2f}, σ={std:.2f})')
-                        # Shapiro‑Wilk test (only if sample size reasonable)
-                        if 3 <= len(residuals) <= 5000:
-                            from scipy.stats import shapiro
-                            _, p_val = shapiro(residuals)
-                            ax.text(0.05, 0.95, f'Shapiro-Wilk p={p_val:.3f}', transform=ax.transAxes,
-                                    verticalalignment='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-                        ax.set_xlabel('Residual (s)', fontsize=12)
-                        ax.set_ylabel('Density', fontsize=12)
-                        ax.set_title('Residuals distribution (validation)', fontsize=14)
-                        ax.legend(loc='best', fontsize=9)
-                        ax.grid(True, alpha=0.3)
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(viz_task_dir, f"{out_prefix}_reg_residuals.png"), dpi=300, bbox_inches='tight')
-                        plt.close()
+                        prob = torch.softmax(logits, dim=1)
+                        pred = prob.argmax(dim=1)
+                        target = batch.seq_targets.long().reshape(-1)
 
-                        # 3. Bland‑Altman plot
-                        plot_bland_altman(y_true, y_pred, title="Bland–Altman — early_reg (validation)",
-                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_bland_altman.png"))
+                        y_true.extend(
+                            target.detach().cpu().numpy().reshape(-1).tolist()
+                        )
+                        y_pred.extend(
+                            pred.detach().cpu().numpy().reshape(-1).tolist()
+                        )
+                        y_prob.extend(
+                            prob.detach().cpu().numpy().tolist()
+                        )
 
-                        # ========== TRAINING PLOTS (identical structure) ==========
-                        y_true_train, y_pred_train = [], []
-                        with torch.no_grad():
-                            for b in train_loader:
-                                b = b.to(self.device)
-                                ew = getattr(b, "edge_weight", None)
-                                pred_sc = self.model(b.x, b.edge_index, b, task="forecast_time", edge_weight=ew).cpu().numpy()
-                                true_sc = b.seq_targets.cpu().numpy()
-                                if self.regression_scaler is not None:
-                                    y_pred_train.extend(np.expm1(self.regression_scaler.inverse_transform(pred_sc.reshape(-1, 1))).flatten())
-                                    y_true_train.extend(np.expm1(self.regression_scaler.inverse_transform(true_sc.reshape(-1, 1))).flatten())
-                                else:
-                                    y_pred_train.extend(pred_sc.flatten())
-                                    y_true_train.extend(true_sc.flatten())
-                        y_true_train = np.array(y_true_train, dtype=float)
-                        y_pred_train = np.array(y_pred_train, dtype=float)
+                    else:
+                        out = self.model(
+                            batch.x,
+                            batch.edge_index,
+                            batch,
+                            task="forecast_time",
+                            edge_weight=ew
+                        ).reshape(-1)
 
-                        # Scatter (training)
-                        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-                        ax.scatter(y_true_train, y_pred_train, s=15, alpha=0.6, edgecolors='k', linewidth=0.5, label='Predictions')
-                        add_best_fit_line(ax, y_true_train, y_pred_train)
-                        lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
-                        ax.plot(lims, lims, 'k--', alpha=0.5, label='Ideal (y=x)')
-                        ax.set_xlabel('True TTI (s)', fontsize=12)
-                        ax.set_ylabel('Predicted TTI (s)', fontsize=12)
-                        ax.set_title('Early regression — training set', fontsize=14)
-                        ax.legend(loc='best', fontsize=9)
-                        ax.grid(True, alpha=0.3)
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(viz_task_dir, f"{out_prefix}_train_reg_scatter.png"), dpi=300, bbox_inches='tight')
-                        plt.close()
+                        target = batch.seq_targets.float().reshape(-1)
 
-                        # Residuals (training)
-                        residuals_train = y_pred_train - y_true_train
-                        fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
-                        ax.hist(residuals_train, bins=30, density=True, alpha=0.7, color='steelblue', edgecolor='black', linewidth=0.8)
-                        mu_t, std_t = np.mean(residuals_train), np.std(residuals_train)
-                        x_fit_t = np.linspace(residuals_train.min(), residuals_train.max(), 200)
-                        pdf_fit_t = norm.pdf(x_fit_t, mu_t, std_t)
-                        ax.plot(x_fit_t, pdf_fit_t, 'r-', linewidth=2, label=f'Normal fit (μ={mu_t:.2f}, σ={std_t:.2f})')
-                        if 3 <= len(residuals_train) <= 5000:
-                            _, p_val_t = shapiro(residuals_train)
-                            ax.text(0.05, 0.95, f'Shapiro-Wilk p={p_val_t:.3f}', transform=ax.transAxes,
-                                    verticalalignment='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-                        ax.set_xlabel('Residual (s)', fontsize=12)
-                        ax.set_ylabel('Density', fontsize=12)
-                        ax.set_title('Residuals distribution (training)', fontsize=14)
-                        ax.legend(loc='best', fontsize=9)
-                        ax.grid(True, alpha=0.3)
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(viz_task_dir, f"{out_prefix}_train_reg_residuals.png"), dpi=300, bbox_inches='tight')
-                        plt.close()
+                        pred_sc = out.detach().cpu().numpy().reshape(-1)
+                        true_sc = target.detach().cpu().numpy().reshape(-1)
 
-                        # Bland‑Altman (training)
-                        plot_bland_altman(y_true_train, y_pred_train, title="Bland–Altman — early_reg (training)",
-                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_train_bland_altman.png"))
+                        if regression_scaler is not None:
+                            pred_log = regression_scaler.inverse_transform(
+                                pred_sc.reshape(-1, 1)
+                            ).reshape(-1)
 
-                        print(f"  ✓ Regression plots saved (publication quality: best‑fit line, residuals + normal fit, Bland‑Altman)")
-                    else:  # early_clf
-                        try:
-                            ys, logits_all = [], []
-                            with torch.no_grad():
-                                for b in val_loader:
-                                    b = b.to(self.device)
-                                    ew = getattr(b, "edge_weight", None)
-                                    logits = self.model(b.x, b.edge_index, b, task="forecast_label", edge_weight=ew)
-                                    ys.extend(b.seq_targets.detach().cpu().numpy().tolist())
-                                    logits_all.append(logits.detach().cpu().numpy())
-                            
-                            ys = np.asarray(ys, int)
-                            logits_all = np.concatenate(logits_all, axis=0)
-                            probs = torch.softmax(torch.tensor(logits_all), dim=1).numpy()
-                            yhat = probs.argmax(axis=1)
-                            
-                            # Get UNIQUE classes present in validation data
-                            val_unique_classes = np.unique(ys)
-                            val_n_classes = len(val_unique_classes)
-                            print(f"  Unique classes in validation set: {val_unique_classes} (Count: {val_n_classes}")
-                            print(f"  Unique classes in predictions: {np.unique(yhat)}")
-                            
-                            # Create mapping for validation classes
-                            val_class_to_idx = {cls: idx for idx, cls in enumerate(val_unique_classes)}
-                            
-                            def safe_map(label, mapping, default=0):
-                                return mapping.get(label, default)
-                            
-                            # Filter predictions to valid classes
-                            valid_pred_mask = np.isin(yhat, val_unique_classes)
-                            n_invalid = np.sum(~valid_pred_mask)
-                            if n_invalid > 0:
-                                print(f"  Warning: {n_invalid} predictions for classes not in validation set")
-                            
-                            yhat_filtered = yhat[valid_pred_mask]
-                            ys_filtered = ys[valid_pred_mask]
-                            
-                            if len(yhat_filtered) > 0:
-                                yhat_mapped = np.array([safe_map(y, val_class_to_idx) for y in yhat_filtered])
-                                ys_mapped = np.array([safe_map(y, val_class_to_idx) for y in ys_filtered])
-                                
-                                # Get class names
-                                val_class_names = []
-                                for cls in val_unique_classes:
-                                    if cls < len(self.real_class_names):
-                                        val_class_names.append(self.real_class_names[cls])
-                                    else:
-                                        val_class_names.append(f"class_{cls}")
-                                
-                                # Plot confusion matrix
-                                self.viz.confusion(ys_mapped, yhat_mapped, class_names=val_class_names,
-                                                title=f"Confusion — early label forecast (Validation)",
-                                                fname=os.path.join(viz_task_dir, f"{out_prefix}_cm.png"), normalize=False)
-                            
-                            # Training confusion matrix
-                            if len(train_labels_list) > 0 and len(train_preds_list) > 0:
-                                train_labels = np.array(train_labels_list)
-                                train_preds = np.array(train_preds_list)
-                                
-                                train_mask = np.isin(train_labels, val_unique_classes)
-                                train_labels_filtered = train_labels[train_mask]
-                                train_preds_filtered = train_preds[train_mask]
-                                
-                                train_pred_mask = np.isin(train_preds_filtered, val_unique_classes)
-                                train_labels_filtered = train_labels_filtered[train_pred_mask]
-                                train_preds_filtered = train_preds_filtered[train_pred_mask]
-                                
-                                if len(train_labels_filtered) > 0:
-                                    train_labels_mapped = np.array([safe_map(y, val_class_to_idx) for y in train_labels_filtered])
-                                    train_preds_mapped = np.array([safe_map(y, val_class_to_idx) for y in train_preds_filtered])
-                                    
-                                    self.viz.confusion(train_labels_mapped, train_preds_mapped, class_names=val_class_names,
-                                                    title=f"Confusion — early label forecast (Training)",
-                                                    fname=os.path.join(viz_task_dir, f"{out_prefix}_cm_train.png"), normalize=False)
-                            
-                            # Per-class curves
-                            for cls in val_unique_classes:
-                                y_bin = (ys == cls).astype(int)
-                                
-                                if cls < probs.shape[1]:
-                                    p_bin = probs[:, cls]
-                                else:
-                                    continue
-                                
-                                class_name = self.real_class_names[cls] if cls < len(self.real_class_names) else f"class_{cls}"
-                                
-                                n_pos = np.sum(y_bin)
-                                n_neg = len(y_bin) - n_pos
-                                
-                                if n_pos > 0 and n_neg > 0:
-                                    self.viz.pr_curve(y_bin, p_bin, title=f"PR — early_clf class {class_name}",
-                                                    fname=os.path.join(viz_task_dir, f"{out_prefix}_pr_c{cls}.png"))
-                                    self.viz.reliability_curve(y_bin, p_bin, title=f"Calibration — early_clf class {class_name}",
-                                                            fname=os.path.join(viz_task_dir, f"{out_prefix}_calib_c{cls}.png"))
-                                    self.viz.roc_with_ci(y_bin, p_bin, title=f"ROC (95% CI) — early_clf class {class_name}",
-                                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_roc_ci_c{cls}.png"))
-                            
-                            print(f"  ✓ Early label plots saved for {val_n_classes} classes")
-                            
-                        except Exception as e:
-                            print(f"  ✗ Early label visuals failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-                except Exception as e:
-                    print(f"  ✗ Temporal heatmap skipped: {e}")
+                            true_log = regression_scaler.inverse_transform(
+                                true_sc.reshape(-1, 1)
+                            ).reshape(-1)
 
-                # ========== 7. LEARNING CURVE ==========
-                if len(epoch_idx) > 0:
-                    try:
-                        has_valid_train = any(np.isfinite(x) for x in train_trace)
-                        has_valid_val = any(np.isfinite(x) for x in val_trace)
-                        
-                        if has_valid_train or has_valid_val:
-                            metric_name = "R²" if early_reg else "Accuracy"
-                            clean_epochs = []
-                            clean_train = []
-                            clean_val = []
-                            
-                            for ep, tr, va in zip(epoch_idx, train_trace, val_trace):
-                                if np.isfinite(tr) or np.isfinite(va):
-                                    clean_epochs.append(ep)
-                                    clean_train.append(tr if np.isfinite(tr) else 0.0)
-                                    clean_val.append(va if np.isfinite(va) else 0.0)
-                            
-                            if len(clean_epochs) > 0:
-                                self.viz.learning_curve(clean_epochs, clean_train, clean_val,
-                                                        title=f"Learning Curve ({metric_name}) — {task}",
-                                                        fname=os.path.join(viz_task_dir, f"{out_prefix}_learning.png"))
-                                print(f"  ✓ Learning curve saved")
-                            else:
-                                print(f"  ✗ Learning curve skipped: No valid data points")
+                            pred_raw = np.expm1(pred_log)
+                            true_raw = np.expm1(true_log)
+
                         else:
-                            print(f"  ✗ Learning curve skipped: No valid data (all NaN/Inf)")
-                    except Exception as e:
-                        print(f"  ✗ Learning curve skipped: {e}")
+                            pred_raw = pred_sc
+                            true_raw = true_sc
+
+                        y_true.extend(true_raw.reshape(-1).tolist())
+                        y_pred.extend(pred_raw.reshape(-1).tolist())
+
+            return (
+                np.asarray(y_true),
+                np.asarray(y_pred),
+                np.asarray(y_prob)
+            )
+        def _classification_metrics(y_true, y_pred, y_prob):
+            result = {
+                "accuracy": accuracy_score(y_true, y_pred),
+                "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+                "precision_macro": precision_score(
+                    y_true, y_pred, average="macro", zero_division=0
+                ),
+                "recall_macro": recall_score(
+                    y_true, y_pred, average="macro", zero_division=0
+                ),
+                "f1_macro": f1_score(
+                    y_true, y_pred, average="macro", zero_division=0
+                ),
+                "f1_weighted": f1_score(
+                    y_true, y_pred, average="weighted", zero_division=0
+                ),
+            }
+            if detection:
+                cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+                if cm.shape == (2, 2):
+                    tn, fp, fn, tp = cm.ravel()
+                    result["specificity"] = tn / (tn + fp) if (tn + fp) else 0.0
+                    result["sensitivity"] = tp / (tp + fn) if (tp + fn) else 0.0
+                if len(np.unique(y_true)) == 2 and y_prob.size:
+                    result["roc_auc"] = roc_auc_score(y_true, y_prob.reshape(-1))
+                    result["pr_auc"] = average_precision_score(y_true, y_prob.reshape(-1))
+            return result
+
+        def _regression_metrics(y_true, y_pred):
+            return {
+                "mae": mean_absolute_error(y_true, y_pred),
+                "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+                "r2": self.safe_r2_score(y_true, y_pred),
+            }
+
+        # ------------------------------------------------------------
+        # K-fold training
+        # ------------------------------------------------------------
+        for fold_no, (train_idx, val_idx) in enumerate(folds, start=1):
+            np.random.seed(random_seed + fold_no)
+            torch.manual_seed(random_seed + fold_no)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(random_seed + fold_no)
+
+            _print_fold_summary(fold_no, train_idx, val_idx)
+
+            fold_dir = os.path.join(task_out_dir, f"fold_{fold_no}")
+            ckpt_dir = os.path.join("models", "checkpoints", task, f"fold_{fold_no}")
+            confusion_dir = os.path.join("confusion", task, f"fold_{fold_no}")
+            os.makedirs(fold_dir, exist_ok=True)
+            os.makedirs(ckpt_dir, exist_ok=True)
+            os.makedirs(confusion_dir, exist_ok=True)
+
+            X_train = X_graph[train_idx]
+            X_fold_val = X_graph[val_idx]
+            Y_train_raw = Y[train_idx]
+            Y_fold_val_raw = Y[val_idx]
+
+            # --------------------------------------------------------
+            # Fold-local feature scaling
+            # --------------------------------------------------------
+            self.feature_scaler = StandardScaler()
+            tr_shape = X_train.shape
+            va_shape = X_fold_val.shape
+            X_train_sc = self.feature_scaler.fit_transform(
+                X_train.reshape(-1, tr_shape[-1])
+            ).reshape(tr_shape)
+            X_val_sc = self.feature_scaler.transform(
+                X_fold_val.reshape(-1, va_shape[-1])
+            ).reshape(va_shape)
+
+            # Fold-local graph weights use TRAINING fold only.
+            _set_fold_graph_from_training(X_train_sc)
+
+            # --------------------------------------------------------
+            # Targets / loaders
+            # --------------------------------------------------------
+            self.regression_scaler = None
+            Y_for_weights = Y_train_raw.copy()
+
+            if early_reg:
+                self.regression_scaler = StandardScaler()
+                y_tr_log = np.log1p(Y_train_raw.astype(float))
+                y_va_log = np.log1p(Y_fold_val_raw.astype(float))
+                Y_train_model = self.regression_scaler.fit_transform(
+                    y_tr_log.reshape(-1, 1)
+                ).reshape(-1)
+                Y_val_model = self.regression_scaler.transform(
+                    y_va_log.reshape(-1, 1)
+                ).reshape(-1)
+                train_loader, _, _ = self._sequence_loader_from_arrays(
+                    X_train_sc, Y_train_model, task, shuffle=True
+                )
+                val_loader, _, _ = self._sequence_loader_from_arrays(
+                    X_val_sc, Y_val_model, task, shuffle=False
+                )
+            elif early_clf:
+                Y_train_model = Y_train_raw.astype(int)
+                Y_val_model = Y_fold_val_raw.astype(int)
+                train_loader, _, _ = self._sequence_loader_from_arrays(
+                    X_train_sc, Y_train_model, task, shuffle=True
+                )
+                val_loader, _, _ = self._sequence_loader_from_arrays(
+                    X_val_sc, Y_val_model, task, shuffle=False
+                )
+            else:
+                Y_train_model = Y_train_raw.astype(int)
+                Y_val_model = Y_fold_val_raw.astype(int)
+
+                # Oversampling is TRAIN-FOLD ONLY.
+                if len(np.unique(Y_train_model)) > 1:
+                    try:
+                        X_train_sc, Y_train_model = self.hybrid_oversample(
+                            X_train_sc,
+                            Y_train_model,
+                            num_nodes=self.num_nodes,
+                            floor=10,
+                            smote_cap=1.0,
+                            seed=random_seed + fold_no,
+                        )
+                        print(
+                            "[oversampling] training fold distribution after balancing:",
+                            dict(zip(*np.unique(Y_train_model, return_counts=True)))
+                        )
+                    except Exception as exc:
+                        print(f"[oversampling] skipped for fold {fold_no}: {exc}")
+
+                train_loader = self.create_graph_batches(
+                    X_train_sc, Y_train_model, task=task, shuffle=True
+                )
+                val_loader = self.create_graph_batches(
+                    X_val_sc, Y_val_model, task=task, shuffle=False
+                )
+
+            # --------------------------------------------------------
+            # Fresh model per fold
+            # --------------------------------------------------------
+            self.model = _make_model()
+
+            # Class weighting is based on ORIGINAL (pre-oversampling) fold labels.
+            self.adaptive_loss = AdaptiveHeadLoss(smoothing=0.05, focal_gamma=3.5)
+            if classification or early_clf:
+                present = np.unique(Y_for_weights.astype(int))
+                if len(present) > 1:
+                    cw_present = compute_class_weight(
+                        class_weight="balanced",
+                        classes=present,
+                        y=Y_for_weights.astype(int),
+                    ).astype(float)
+                    weights = np.ones(self.num_classes, dtype=float)
+                    weights[present] = cw_present
+                    missing = np.setdiff1d(np.arange(self.num_classes), present)
+                    if missing.size:
+                        weights[missing] = float(cw_present.max())
+                    weights_t = torch.tensor(
+                        weights, dtype=torch.float32, device=self.device
+                    )
+                    self.adaptive_loss = AdaptiveHeadLoss(
+                        smoothing=0.05,
+                        focal_gamma=5.0,
+                        class_weights=weights_t,
+                    )
+                    print("[loss] class weights:", np.round(weights, 3).tolist())
+
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            if not params:
+                raise RuntimeError("No trainable parameters remain after freezing.")
+
+            lr = 1e-4 if early_reg else self.base_lr
+            wd = 1e-3 if early_reg else self.base_wd
+            self.optimizer = optim.Adam(params, lr=lr, weight_decay=wd)
+            self.scheduler = (
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=max(1, self.num_epochs), eta_min=1e-6
+                )
+                if early_reg else
+                StepLR(self.optimizer, step_size=10, gamma=0.5)
+            )
+
+            best_score = -float("inf")
+            best_epoch = 0
+            patience = 0
+            early_stop_patience = 50
+            best_path = os.path.join(ckpt_dir, f"{task}_best.pth")
+            history_rows = []
+
+            # --------------------------------------------------------
+            # Epoch loop
+            # --------------------------------------------------------
+            for epoch in range(1, self.num_epochs + 1):
+                self.model.train()
+                total_loss = 0.0
+                n_batches = 0
+
+                for batch in train_loader:
+                    batch = batch.to(self.device)
+                    ew = getattr(batch, "edge_weight", None)
+                    self.optimizer.zero_grad()
+
+                    if detection:
+                        out = self.model(
+                            batch.x, batch.edge_index, batch,
+                            task="detection", edge_weight=ew
+                        ).squeeze(-1)
+                        loss = self.adaptive_loss.detection_loss(out, batch.y.float())
+                    elif classification:
+                        out = self.model(
+                            batch.x, batch.edge_index, batch,
+                            task="classification", edge_weight=ew
+                        )
+                        loss = self.adaptive_loss.classification_loss(
+                            out, batch.y.long(), num_classes=self.num_classes
+                        )
+                    elif early_clf:
+                        out = self.model(
+                            batch.x, batch.edge_index, batch,
+                            task="forecast_label", edge_weight=ew
+                        )
+                        loss = self.adaptive_loss.classification_loss(
+                            out, batch.seq_targets.long(), num_classes=self.num_classes
+                        )
+                    else:
+                        out = self.model(
+                            batch.x, batch.edge_index, batch,
+                            task="forecast_time", edge_weight=ew
+                        ).view(-1)
+                        loss = F.smooth_l1_loss(out, batch.seq_targets.float().view(-1))
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    total_loss += float(loss.item())
+                    n_batches += 1
+
+                avg_loss = total_loss / max(1, n_batches)
+                y_true_ep, y_pred_ep, y_prob_ep = _evaluate(
+                    val_loader, regression_scaler=self.regression_scaler
+                )
+
+                if early_reg:
+                    ep_metrics = _regression_metrics(y_true_ep, y_pred_ep)
+                    score = -ep_metrics["rmse"]
+                    metric_text = (
+                        f"Val MAE={ep_metrics['mae']:.3f}s | "
+                        f"RMSE={ep_metrics['rmse']:.3f}s | R2={ep_metrics['r2']:.4f}"
+                    )
                 else:
-                    print(f"  ✗ Learning curve skipped: No epoch data")
-
-                print(f"\n{'='*60}")
-                print(f"VISUALIZATION COMPLETE FOR {task.upper()}")
-                print(f"Files saved to: {viz_task_dir}")
-                print(f"{'='*60}\n")
-
-            except Exception as e:
-                print(f"Visualization error: {e}")
-                import traceback
-                traceback.print_exc()
-
-
-                # ========== STATISTICAL ANALYSIS ==========
-        if val_loader is not None and self.model is not None:
-            try:
-                print(f"\n{'='*70}")
-                print(f"COMPUTING STATISTICAL ANALYSIS FOR {task.upper()}")
-                print(f"{'='*70}")
-                
-                if detection:
-                    # For detection task
-                    ys, ps = [], []
-                    with torch.no_grad():
-                        for b in val_loader:
-                            b = b.to(self.device)
-                            ew = getattr(b, "edge_weight", None)
-                            logit = self.model(b.x, b.edge_index, b, task="detection", edge_weight=ew)
-                            ys.extend(b.y.detach().cpu().numpy().tolist())
-                            ps.extend(torch.sigmoid(logit).detach().cpu().numpy().tolist())
-                    
-                    ys = np.asarray(ys, int)
-                    ps = np.asarray(ps, float)
-                    y_pred_binary = (ps > 0.5).astype(int)
-                    
-                    # Compute statistics with confidence intervals
-                    stats_results = self.compute_statistical_analysis(
-                        ys, y_pred_binary, y_proba=ps, task='detection', n_bootstrap=1000
+                    ep_metrics = _classification_metrics(y_true_ep, y_pred_ep, y_prob_ep)
+                    score = ep_metrics["f1_macro"]
+                    metric_text = (
+                        f"Val Acc={ep_metrics['accuracy']:.4f} | "
+                        f"BalAcc={ep_metrics['balanced_accuracy']:.4f} | "
+                        f"MacroF1={ep_metrics['f1_macro']:.4f}"
                     )
-                    
-                    # Compare with random baseline
-                    random_baseline = np.random.randint(0, 2, size=len(ys))
-                    self.compare_with_baseline(ys, y_pred_binary, random_baseline, task='classification')
-                elif classification or early_clf:
-                    # Collect predictions and probabilities
-                    ys, logits_all = [], []
-                    with torch.no_grad():
-                        for b in val_loader:
-                            b = b.to(self.device)
-                            ew = getattr(b, "edge_weight", None)
-                            # Use the same task string as in training
-                            logits = self.model(b.x, b.edge_index, b, task="forecast_label", edge_weight=ew)
-                            ys.extend(b.seq_targets.detach().cpu().numpy().tolist())
-                            logits_all.append(logits.detach().cpu().numpy())
-                    ys = np.asarray(ys, int)
-                    logits_all = np.concatenate(logits_all, axis=0)
-                    probs = torch.softmax(torch.tensor(logits_all), dim=1).numpy()
-                    y_pred = probs.argmax(axis=1)
 
-                    # ---- Bootstrap with per‑class metrics ----
-                    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score
-                    n_classes = probs.shape[1]
-                    # Get all class labels that actually appear
-                    present_classes = np.unique(ys)
-                    n_bootstrap = 1000
+                history_rows.append({
+                    "fold": fold_no,
+                    "epoch": epoch,
+                    "loss": avg_loss,
+                    **ep_metrics,
+                })
 
-                    # Storage for global metrics and per‑class metrics
-                    global_metrics = {
-                        'accuracy': [], 'balanced_accuracy': [], 
-                        'f1_macro': [], 'f1_weighted': []
-                    }
-                    per_class_metrics = {
-                        'precision': {c: [] for c in present_classes},
-                        'recall': {c: [] for c in present_classes},
-                        'f1': {c: [] for c in present_classes}
-                    }
+                print(
+                    f"Fold {fold_no} | Epoch {epoch}/{self.num_epochs} | "
+                    f"Loss={avg_loss:.5f} | {metric_text}"
+                )
 
-                    np.random.seed(42)
-                    n = len(ys)
-
-                    for _ in range(n_bootstrap):
-                        idx = np.random.choice(n, n, replace=True)
-                        y_true_b = ys[idx]
-                        y_pred_b = y_pred[idx]
-
-                        global_metrics['accuracy'].append(accuracy_score(y_true_b, y_pred_b))
-                        global_metrics['balanced_accuracy'].append(balanced_accuracy_score(y_true_b, y_pred_b))
-                        global_metrics['f1_macro'].append(f1_score(y_true_b, y_pred_b, average='macro', zero_division=0))
-                        global_metrics['f1_weighted'].append(f1_score(y_true_b, y_pred_b, average='weighted', zero_division=0))
-
-                        # Per‑class metrics (only for classes present in this bootstrap sample)
-                        for c in present_classes:
-                            # Convert to binary
-                            y_true_c = (y_true_b == c).astype(int)
-                            y_pred_c = (y_pred_b == c).astype(int)
-                            # Precision (avoid division by zero)
-                            p = precision_score(y_true_c, y_pred_c, zero_division=0)
-                            r = recall_score(y_true_c, y_pred_c, zero_division=0)
-                            f = f1_score(y_true_c, y_pred_c, zero_division=0)
-                            per_class_metrics['precision'][c].append(p)
-                            per_class_metrics['recall'][c].append(r)
-                            per_class_metrics['f1'][c].append(f)
-
-                    # Aggregate global metrics with confidence intervals
-                    stats_results = {'metrics': {}}
-                    for name, values in global_metrics.items():
-                        stats_results['metrics'][name] = {
-                            'mean': np.mean(values),
-                            'std': np.std(values),
-                            'ci_lower': np.percentile(values, 2.5),
-                            'ci_upper': np.percentile(values, 97.5)
-                        }
-
-                    # Add per‑class metrics to the same 'metrics' dict (flattened)
-                    for metric_type in ['precision', 'recall', 'f1']:
-                        for c in present_classes:
-                            values = per_class_metrics[metric_type][c]
-                            metric_name = f"{metric_type}_class_{c}"
-                            stats_results['metrics'][metric_name] = {
-                                'mean': np.mean(values),
-                                'std': np.std(values),
-                                'ci_lower': np.percentile(values, 2.5),
-                                'ci_upper': np.percentile(values, 97.5)
-                            }
-                            # Also add class name if available
-                            if hasattr(self, 'real_class_names') and c < len(self.real_class_names):
-                                metric_name_named = f"{metric_type}_{self.real_class_names[c]}"
-                                stats_results['metrics'][metric_name_named] = stats_results['metrics'][metric_name].copy()
-
-                    # Print global metrics table
-                    print("\n" + "="*70)
-                    print(f"STATISTICAL ANALYSIS - {task.upper()} (validation set)")
-                    print("="*70)
-                    print(f"{'Metric':<25} {'Mean':<12} {'Std':<12} {'95% CI':<20}")
-                    print("-"*70)
-                    for name, m in stats_results['metrics'].items():
-                        if not any(x in name for x in ['precision_', 'recall_', 'f1_']):  # print global first
-                            print(f"{name:<25} {m['mean']:<12.4f} {m['std']:<12.4f} [{m['ci_lower']:<8.4f}, {m['ci_upper']:<8.4f}]")
-                    
-                    # Print per‑class metrics
-                    print("\n" + "-"*70)
-                    print("Per‑class metrics (validation):")
-                    for c in present_classes:
-                        class_name = (self.real_class_names[c] if hasattr(self, 'real_class_names') and c < len(self.real_class_names) else f"Class {c}")
-                        print(f"\n{class_name}:")
-                        for metric_type in ['precision', 'recall', 'f1']:
-                            key = f"{metric_type}_class_{c}"
-                            m = stats_results['metrics'][key]
-                            print(f"  {metric_type.capitalize()}: {m['mean']:.4f} ± {m['std']:.4f} 95%CI [{m['ci_lower']:.4f}, {m['ci_upper']:.4f}]")
-
-                    # Compare with majority class baseline (as before)
-                    from sklearn.dummy import DummyClassifier
-                    from sklearn.metrics import accuracy_score
-                    from scipy.stats import wilcoxon
-
-                    dummy = DummyClassifier(strategy='most_frequent')
-                    dummy.fit(ys, ys)
-                    y_pred_baseline = dummy.predict(ys)
-                    base_acc = accuracy_score(ys, y_pred_baseline)
-                    model_acc = stats_results['metrics']['accuracy']['mean']
-                    model_err = (y_pred != ys).astype(int)
-                    baseline_err = (y_pred_baseline != ys).astype(int)
-                    _, p_val = wilcoxon(model_err, baseline_err, alternative='less')
-                    print("\n" + "="*70)
-                    print("MODEL VS MAJORITY CLASS BASELINE")
-                    print("="*70)
-                    print(f"Model accuracy: {model_acc:.4f}")
-                    print(f"Baseline accuracy: {base_acc:.4f}")
-                    print(f"Improvement: {model_acc - base_acc:.4f}")
-                    print(f"Wilcoxon p-value (model better): {p_val:.6f}")
-                    print(f"Statistically Significant: {'YES' if p_val < 0.05 else 'NO'}")
-
-                # Save CSV (same as before)
-                    
-                # elif classification or early_clf:
-                #     # For classification task
-                #     ys, logits_all = [], []
-                #     with torch.no_grad():
-                #         for b in val_loader:
-                #             b = b.to(self.device)
-                #             ew = getattr(b, "edge_weight", None)
-                #             logits = self.model(b.x, b.edge_index, b, task="early_clf", edge_weight=ew)
-                #             ys.extend(b.seq_targets.detach().cpu().numpy().tolist())
-                #             logits_all.append(logits.detach().cpu().numpy())
-                    
-                #     ys = np.asarray(ys, int)
-                #     logits_all = np.concatenate(logits_all, axis=0)
-                #     probs = torch.softmax(torch.tensor(logits_all), dim=1).numpy()
-                #     y_pred = probs.argmax(axis=1)
-                    
-                #     # Compute statistics with confidence intervals
-                #     stats_results = self.compute_statistical_analysis(
-                #         ys, y_pred, y_proba=probs, task='early_clf', n_bootstrap=1000
-                #     )
-                    
-                #     # Compare with majority class baseline
-                #     from sklearn.dummy import DummyClassifier
-                #     dummy = DummyClassifier(strategy='most_frequent')
-                #     dummy.fit(ys, ys)
-                #     y_pred_baseline = dummy.predict(ys)
-                #     self.compare_with_baseline(ys, y_pred, y_pred_baseline, task='classification')
-                    
-                elif early_reg:
-                    # For regression task
-                    y_true, y_pred = [], []
-                    with torch.no_grad():
-                        for b in val_loader:
-                            b = b.to(self.device)
-                            ew = getattr(b, "edge_weight", None)
-                            pred_sc = self.model(b.x, b.edge_index, b, task="forecast_time", edge_weight=ew).cpu().numpy()
-                            if self.regression_scaler is not None:
-                                y_pred.extend(np.expm1(self.regression_scaler.inverse_transform(pred_sc.reshape(-1, 1))).flatten())
-                            else:
-                                y_pred.extend(pred_sc.flatten())
-                            # y_true.extend(b.y.detach().cpu().numpy().tolist())
-                            y_true.extend(b.seq_targets.detach().cpu().numpy().tolist())
-                    
-                    y_true = np.array(y_true, dtype=float)
-                    y_pred = np.array(y_pred, dtype=float)
-                    
-                    if self.regression_scaler is not None:
-                        y_true = np.expm1(self.regression_scaler.inverse_transform(y_true.reshape(-1, 1))).flatten()
-                    
-                    # Compute statistics with confidence intervals
-                    stats_results = self.compute_statistical_analysis(
-                        y_true, y_pred, task='regression', n_bootstrap=1000
+                if score > best_score:
+                    best_score = score
+                    best_epoch = epoch
+                    patience = 0
+                    torch.save(
+                        {
+                            "model_state_dict": self.model.state_dict(),
+                            "optimizer_state_dict": self.optimizer.state_dict(),
+                            "epoch": epoch,
+                            "fold": fold_no,
+                            "task": task,
+                            "score": score,
+                            "in_dim": in_dim_actual,
+                            "num_nodes": self.num_nodes,
+                            "num_classes": self.num_classes,
+                            "seq_len": self.seq_len,
+                        },
+                        best_path,
                     )
-                    
-                    # Compare with mean baseline
-                    mean_baseline = np.full_like(y_true, np.mean(y_true))
-                    self.compare_with_baseline(y_true, y_pred, mean_baseline, task='regression')
-                
-                # Save statistical results to CSV
-                import csv
-                stats_file = os.path.join(viz_task_dir, f"{out_prefix}_statistical_analysis.csv")
-                with open(stats_file, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['Metric', 'Mean', 'Std', 'CI_Lower', 'CI_Upper'])
-                    for metric_name, metric_data in stats_results['metrics'].items():
-                        writer.writerow([
-                            metric_name,
-                            f"{metric_data['mean']:.4f}",
-                            f"{metric_data['std']:.4f}",
-                            f"{metric_data['ci_lower']:.4f}",
-                            f"{metric_data['ci_upper']:.4f}"
-                        ])
-                
-                print(f"\n  ✓ Statistical analysis saved to {stats_file}")
-                
-            except Exception as e:
-                print(f"  ✗ Statistical analysis failed: {e}")
-                import traceback
-                traceback.print_exc()
+                else:
+                    patience += 1
+
+                self.scheduler.step()
+                if patience >= early_stop_patience:
+                    print(
+                        f"[early stopping] Fold {fold_no} stopped at epoch {epoch}; "
+                        f"best epoch={best_epoch}."
+                    )
+                    break
+
+            # --------------------------------------------------------
+            # Load fold-best model and final fold evaluation
+            # --------------------------------------------------------
+            checkpoint = torch.load(best_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+
+            y_true, y_pred, y_prob = _evaluate(
+                val_loader, regression_scaler=self.regression_scaler
+            )
+
+            if early_reg:
+                fold_metrics = _regression_metrics(y_true, y_pred)
+                fold_score = -fold_metrics["rmse"]
+            else:
+                fold_metrics = _classification_metrics(y_true, y_pred, y_prob)
+                fold_score = fold_metrics["f1_macro"]
+
+            fold_metric_rows.append({
+                "fold": fold_no,
+                "best_epoch": best_epoch,
+                "train_samples": len(train_idx),
+                "validation_samples": len(val_idx),
+                "train_patients": len(np.unique(file_ids[train_idx])),
+                "validation_patients": len(np.unique(file_ids[val_idx])),
+                **fold_metrics,
+            })
+
+            pd.DataFrame(history_rows).to_csv(
+                os.path.join(fold_dir, "training_history.csv"), index=False
+            )
+
+            np.savez_compressed(
+                os.path.join(fold_dir, "validation_predictions.npz"),
+                y_true=y_true,
+                y_pred=y_pred,
+                y_prob=y_prob,
+                validation_indices=val_idx,
+                validation_patient_ids=file_ids[val_idx],
+            )
+
+            all_oof_true.extend(y_true.tolist())
+            all_oof_pred.extend(y_pred.tolist())
+            if y_prob.size:
+                all_oof_prob.extend(y_prob.tolist())
+
+            print(f"\n[FOLD {fold_no}] FINAL METRICS")
+            for k, v in fold_metrics.items():
+                print(f"  {k:<22}: {v:.6f}")
+
+            # Per-fold confusion matrix for categorical tasks.
+            if not early_reg:
+                try:
+                    confusion_task = "forecast_label" if early_clf else task
+                    save_task_confusion(
+                        self.model,
+                        val_loader,
+                        confusion_task,
+                        self.device,
+                        out_dir=confusion_dir,
+                    )
+                except Exception as exc:
+                    print(f"[confusion] fold {fold_no} skipped: {exc}")
+
+            if explain_after:
+                try:
+                    self.generate_interpretability_visualizations(
+                        val_loader, model_task
+                    )
+                except Exception as exc:
+                    print(f"[interpretability] fold {fold_no} skipped: {exc}")
+
+            if fold_score > best_global_score:
+                best_global_score = fold_score
+                best_global_fold = fold_no
+                best_global_checkpoint = best_path
+
+            # Fold-specific shared exports are always preserved when requested.
+            if save_backbone_to:
+                root, ext = os.path.splitext(save_backbone_to)
+                fold_backbone = f"{root}_fold{fold_no}{ext or '.pth'}"
+                self.model.save_backbone(fold_backbone)
+                print(f"[shared] fold backbone saved -> {fold_backbone}")
+            if save_gru_to:
+                root, ext = os.path.splitext(save_gru_to)
+                fold_gru = f"{root}_fold{fold_no}{ext or '.pth'}"
+                self.model.save_temporal(fold_gru)
+                print(f"[shared] fold GRU saved -> {fold_gru}")
+
+        # ------------------------------------------------------------
+        # Save dataset summary and fold metrics
+        # ------------------------------------------------------------
+        summary_df = pd.DataFrame(summary_rows)
+        summary_csv = os.path.join(task_out_dir, f"{task}_kfold_dataset_summary.csv")
+        summary_df.to_csv(summary_csv, index=False)
+
+        metrics_df = pd.DataFrame(fold_metric_rows)
+        metrics_csv = os.path.join(task_out_dir, f"{task}_kfold_metrics.csv")
+        metrics_df.to_csv(metrics_csv, index=False)
+
+        # Aggregate numerical metrics across folds.
+        aggregate_rows = []
+        metric_columns = [
+            c for c in metrics_df.columns
+            if c not in {
+                "fold", "best_epoch", "train_samples", "validation_samples",
+                "train_patients", "validation_patients"
+            }
+            and np.issubdtype(metrics_df[c].dtype, np.number)
+        ]
+        for col in metric_columns:
+            vals = metrics_df[col].astype(float).to_numpy()
+            aggregate_rows.append({
+                "metric": col,
+                "mean": float(np.mean(vals)),
+                "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+                "min": float(np.min(vals)),
+                "max": float(np.max(vals)),
+            })
+        aggregate_df = pd.DataFrame(aggregate_rows)
+        aggregate_csv = os.path.join(task_out_dir, f"{task}_kfold_aggregate.csv")
+        aggregate_df.to_csv(aggregate_csv, index=False)
+
+        np.savez_compressed(
+            os.path.join(task_out_dir, f"{task}_oof_predictions.npz"),
+            y_true=np.asarray(all_oof_true),
+            y_pred=np.asarray(all_oof_pred),
+            y_prob=np.asarray(all_oof_prob),
+        )
+
+        print("\n" + "=" * 86)
+        print(f"{actual_splits}-FOLD PATIENT-WISE CV COMPLETE — {task.upper()}")
+        print("=" * 86)
+        print(f"Dataset summary: {summary_csv}")
+        print(f"Fold metrics:    {metrics_csv}")
+        print(f"Aggregate:       {aggregate_csv}")
+        print(f"Best fold:       {best_global_fold}")
+        for _, row in aggregate_df.iterrows():
+            print(
+                f"  {row['metric']:<22} = {row['mean']:.6f} ± {row['std']:.6f}"
+            )
+        print("=" * 86)
+
+        # Export the best fold's shared components to legacy requested paths,
+        # while fold-specific exports above remain available for rigorous CV.
+        if best_global_checkpoint and (save_backbone_to or save_gru_to):
+            ckpt = torch.load(best_global_checkpoint, map_location=self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            if save_backbone_to:
+                self.model.save_backbone(save_backbone_to)
+                print(f"[shared] best-fold backbone -> {save_backbone_to}")
+            if save_gru_to:
+                self.model.save_temporal(save_gru_to)
+                print(f"[shared] best-fold GRU -> {save_gru_to}")
+
+        return {
+            "task": task,
+            "n_splits": actual_splits,
+            "best_fold": best_global_fold,
+            "best_checkpoint": best_global_checkpoint,
+            "fold_metrics": fold_metric_rows,
+            "aggregate_metrics": aggregate_rows,
+            "dataset_summary_csv": summary_csv,
+            "metrics_csv": metrics_csv,
+            "aggregate_csv": aggregate_csv,
+        }
 
