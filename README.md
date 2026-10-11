@@ -67,7 +67,7 @@ This framework advances computational neuroscience by enabling holistic EEG anal
 ## Usage
 
 ### Data Preparation
-- Preprocess EEG data into 12-second clips (512 samples at 256 Hz sampling rate) with band-pass filtering (0.5-50 Hz).
+- Preprocess EEG data into 1-second clips (512 samples at 200 Hz sampling rate) with band-pass filtering (0.5-50 Hz).
 - Run the synthesis script to generate hybrid graph structures and task-specific labels (binary for detection, multiclass for classification, temporal for forecasting):
   ```
   python src/data/preprocess.py --input_dir data/tusz --output_dir data/processed --clip_length 2 --sample_rate 256
